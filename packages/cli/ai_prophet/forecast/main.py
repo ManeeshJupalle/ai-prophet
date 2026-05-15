@@ -396,7 +396,7 @@ def predict(
 
     out_path = Path(output)
     out_path.write_text(submission.model_dump_json(indent=2))
-    click.echo(f"\nPredictions ({len(predictions)} markets) → {out_path}")
+    click.echo(f"\nPredictions ({len(predictions)} markets) -> {out_path}")
 
 
 @cli.command(name="evaluate")
