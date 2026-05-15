@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import re
+import time
 from typing import Any
 
 import httpx
@@ -40,6 +41,7 @@ OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "anthropic/claude-sonnet-4
 ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
 
 DEFAULT_TIMEOUT = float(os.environ.get("LLM_TIMEOUT_SECONDS", "45"))
+RATE_LIMIT_RETRY_DELAY = float(os.environ.get("LLM_RATE_LIMIT_DELAY_SECONDS", "10"))
 
 _PROVIDER_CHAINS: dict[str, list[str]] = {
     "research": ["groq", "openrouter", "anthropic"],
@@ -179,6 +181,47 @@ _DISPATCH = {
 }
 
 
+def _is_rate_limit_error(exc: BaseException) -> bool:
+    """Return True if ``exc`` represents a 429 from any supported provider."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code == 429
+    try:
+        import anthropic
+
+        if isinstance(exc, anthropic.RateLimitError):
+            return True
+    except ImportError:
+        pass
+    return False
+
+
+def _call_with_rate_limit_retry(
+    provider: str,
+    fn: Any,
+    system: str,
+    user: str,
+    temperature: float,
+    max_tokens: int,
+) -> str:
+    """Invoke a provider, retrying once after a delay on HTTP 429.
+
+    If the retry also fails (rate-limited or otherwise) the exception is
+    propagated so the outer dispatch loop falls through to the next provider.
+    """
+    try:
+        return fn(system, user, temperature, max_tokens)
+    except Exception as exc:  # noqa: BLE001
+        if not _is_rate_limit_error(exc):
+            raise
+        logger.warning(
+            "llm.rate_limit provider=%s sleeping=%.1fs before retry",
+            provider,
+            RATE_LIMIT_RETRY_DELAY,
+        )
+        time.sleep(RATE_LIMIT_RETRY_DELAY)
+        return fn(system, user, temperature, max_tokens)
+
+
 # Public API -----------------------------------------------------------------
 
 
@@ -220,7 +263,9 @@ def call_llm(
         fn = _DISPATCH[provider]
         try:
             logger.debug("llm.call provider=%s tier=%s", provider, tier)
-            return fn(system, user, temperature, max_tokens)
+            return _call_with_rate_limit_retry(
+                provider, fn, system, user, temperature, max_tokens
+            )
         except Exception as exc:  # noqa: BLE001
             logger.info("llm.call provider=%s failed: %s", provider, exc)
             last_error = exc

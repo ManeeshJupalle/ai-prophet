@@ -173,6 +173,19 @@ def forecast_event(event: EventRequest) -> FinalPrediction:
 # ---------------------------------------------------------------------------
 
 
+def _prediction_delay_seconds() -> float:
+    """Read PREDICTION_DELAY from the environment, defaulting to 5 seconds.
+
+    Negative or unparseable values fall back to the default.
+    """
+    raw = os.environ.get("PREDICTION_DELAY", "5")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 5.0
+    return max(0.0, value)
+
+
 def predict(event: dict) -> dict:
     """CLI-facing prediction function.
 
@@ -180,17 +193,27 @@ def predict(event: dict) -> dict:
     ``{"p_yes": float, "rationale": str}`` payload expected by
     ``prophet forecast predict``. Failures are swallowed and yield a safe
     fallback of ``p_yes=0.5``.
+
+    After each call this function sleeps for ``PREDICTION_DELAY`` seconds
+    (default 5, overridable via the ``PREDICTION_DELAY`` env var) so that
+    callers iterating over many events stay within provider rate limits.
     """
     try:
         event_req = _coerce_event(event)
         final = forecast_event(event_req)
-        return {"p_yes": final.p_yes, "rationale": final.rationale}
+        result = {"p_yes": final.p_yes, "rationale": final.rationale}
     except Exception as exc:  # noqa: BLE001 — never crash the CLI
         logger.exception("predict() failed: %s", exc)
-        return {
+        result = {
             "p_yes": 0.5,
             "rationale": f"Ensemble agent failed: {exc}. Defaulting to 0.5.",
         }
+
+    delay = _prediction_delay_seconds()
+    if delay > 0:
+        logger.info("predict.pacing sleeping=%.1fs", delay)
+        time.sleep(delay)
+    return result
 
 
 # ---------------------------------------------------------------------------

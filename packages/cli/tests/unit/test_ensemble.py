@@ -237,6 +237,8 @@ def test_predict_returns_valid_payload_with_no_keys(monkeypatch) -> None:
     # Ensure no provider keys are available.
     for key in ("GROQ_API_KEY", "OPENROUTER_API_KEY", "ANTHROPIC_API_KEY"):
         monkeypatch.delenv(key, raising=False)
+    # Pacing sleep would slow the suite — disable it for this test.
+    monkeypatch.setenv("PREDICTION_DELAY", "0")
     # Prevent the researcher from making real HTTP calls.
     monkeypatch.setattr(
         "ai_prophet.forecast.ensemble_agent.research_event",
@@ -256,3 +258,128 @@ def test_predict_returns_valid_payload_with_no_keys(monkeypatch) -> None:
     assert 0.01 <= result["p_yes"] <= 0.99
     assert isinstance(result["rationale"], str)
     assert result["rationale"]
+
+
+# ---------------------------------------------------------------------------
+# Rate-limit retry + pacing
+# ---------------------------------------------------------------------------
+
+
+def test_call_with_rate_limit_retry_retries_once_on_429(monkeypatch) -> None:
+    """A 429 from a provider triggers exactly one retry after a delay."""
+    import httpx
+    from ai_prophet.forecast import llm_utils
+
+    sleeps: list[float] = []
+    monkeypatch.setattr(llm_utils.time, "sleep", lambda s: sleeps.append(s))
+
+    calls = {"n": 0}
+
+    def fake_provider(system, user, temperature, max_tokens):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            response = httpx.Response(429, request=httpx.Request("POST", "http://x"))
+            raise httpx.HTTPStatusError("rate limited", request=response.request, response=response)
+        return "ok"
+
+    result = llm_utils._call_with_rate_limit_retry(
+        "groq", fake_provider, "sys", "usr", 0.2, 100
+    )
+    assert result == "ok"
+    assert calls["n"] == 2
+    assert sleeps == [llm_utils.RATE_LIMIT_RETRY_DELAY]
+
+
+def test_call_with_rate_limit_retry_propagates_non_429(monkeypatch) -> None:
+    """Non-429 errors are not retried — they fall straight through to dispatch."""
+    from ai_prophet.forecast import llm_utils
+
+    sleeps: list[float] = []
+    monkeypatch.setattr(llm_utils.time, "sleep", lambda s: sleeps.append(s))
+
+    calls = {"n": 0}
+
+    def fake_provider(system, user, temperature, max_tokens):
+        calls["n"] += 1
+        raise RuntimeError("not a rate limit")
+
+    with pytest.raises(RuntimeError):
+        llm_utils._call_with_rate_limit_retry(
+            "groq", fake_provider, "sys", "usr", 0.2, 100
+        )
+    assert calls["n"] == 1
+    assert sleeps == []
+
+
+def test_call_with_rate_limit_retry_gives_up_after_one_retry(monkeypatch) -> None:
+    """Two consecutive 429s let the exception propagate to dispatch."""
+    import httpx
+    from ai_prophet.forecast import llm_utils
+
+    monkeypatch.setattr(llm_utils.time, "sleep", lambda s: None)
+
+    def always_429(system, user, temperature, max_tokens):
+        response = httpx.Response(429, request=httpx.Request("POST", "http://x"))
+        raise httpx.HTTPStatusError("rate limited", request=response.request, response=response)
+
+    with pytest.raises(httpx.HTTPStatusError):
+        llm_utils._call_with_rate_limit_retry(
+            "groq", always_429, "sys", "usr", 0.2, 100
+        )
+
+
+def test_predict_sleeps_for_prediction_delay(monkeypatch) -> None:
+    """predict() sleeps for PREDICTION_DELAY seconds after each event."""
+    from ai_prophet.forecast import ensemble_agent
+
+    monkeypatch.setenv("PREDICTION_DELAY", "3")
+    monkeypatch.setattr(
+        "ai_prophet.forecast.ensemble_agent.research_event",
+        lambda **_kw: "",
+    )
+    for key in ("GROQ_API_KEY", "OPENROUTER_API_KEY", "ANTHROPIC_API_KEY"):
+        monkeypatch.delenv(key, raising=False)
+
+    sleeps: list[float] = []
+    monkeypatch.setattr(ensemble_agent.time, "sleep", lambda s: sleeps.append(s))
+
+    ensemble_agent.predict({"title": "x"})
+    assert sleeps == [3.0]
+
+
+def test_predict_delay_disabled_when_zero(monkeypatch) -> None:
+    """PREDICTION_DELAY=0 means no sleep at all."""
+    from ai_prophet.forecast import ensemble_agent
+
+    monkeypatch.setenv("PREDICTION_DELAY", "0")
+    monkeypatch.setattr(
+        "ai_prophet.forecast.ensemble_agent.research_event",
+        lambda **_kw: "",
+    )
+    for key in ("GROQ_API_KEY", "OPENROUTER_API_KEY", "ANTHROPIC_API_KEY"):
+        monkeypatch.delenv(key, raising=False)
+
+    sleeps: list[float] = []
+    monkeypatch.setattr(ensemble_agent.time, "sleep", lambda s: sleeps.append(s))
+
+    ensemble_agent.predict({"title": "x"})
+    assert sleeps == []
+
+
+def test_predict_delay_handles_garbage_env_value(monkeypatch) -> None:
+    """An unparseable PREDICTION_DELAY falls back to the 5s default."""
+    from ai_prophet.forecast import ensemble_agent
+
+    monkeypatch.setenv("PREDICTION_DELAY", "not-a-number")
+    monkeypatch.setattr(
+        "ai_prophet.forecast.ensemble_agent.research_event",
+        lambda **_kw: "",
+    )
+    for key in ("GROQ_API_KEY", "OPENROUTER_API_KEY", "ANTHROPIC_API_KEY"):
+        monkeypatch.delenv(key, raising=False)
+
+    sleeps: list[float] = []
+    monkeypatch.setattr(ensemble_agent.time, "sleep", lambda s: sleeps.append(s))
+
+    ensemble_agent.predict({"title": "x"})
+    assert sleeps == [5.0]
