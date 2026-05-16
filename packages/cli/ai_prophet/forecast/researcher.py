@@ -16,7 +16,9 @@ empty) string.
 from __future__ import annotations
 
 import logging
+import random
 import re
+import time
 from datetime import date
 from html import unescape
 from urllib.parse import parse_qs, unquote, urlparse
@@ -28,13 +30,30 @@ from .llm_utils import call_llm_json
 logger = logging.getLogger(__name__)
 
 DDG_HTML_URL = "https://html.duckduckgo.com/html/"
-DEFAULT_USER_AGENT = (
+
+# DDG fingerprints aggressively. Empirically Chrome-on-Windows and Safari-on-Mac
+# UAs reliably return search results; Firefox-on-Windows and curl get the 202
+# "anomaly detected" page. Rotate per request to spread the fingerprint.
+DDG_USER_AGENTS = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
+    "(KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
 )
+DEFAULT_USER_AGENT = DDG_USER_AGENTS[0]
+
 SEARCH_TIMEOUT = 12.0
 FETCH_TIMEOUT = 10.0
 RESEARCH_BRIEF_MAX_CHARS = 8000
+
+# Per-event burst control. DDG starts throttling after ~5-10 rapid queries from
+# the same IP. A jittered inter-query pause is much cheaper than burning every
+# query after the first burst.
+DDG_INTERQUERY_DELAY = (0.4, 1.1)  # uniform seconds
+DDG_THROTTLE_BACKOFF = 5.0  # seconds before retrying a 202/403/429
+DDG_THROTTLE_STATUSES = {202, 403, 429}
 
 
 # ---------------------------------------------------------------------------
@@ -142,22 +161,61 @@ def _normalize_ddg_url(url: str) -> str:
     return url
 
 
+def _ddg_request(query: str, *, user_agent: str, method: str) -> httpx.Response | None:
+    """Issue a single DDG request; return the response or None on transport error."""
+    headers = {
+        "User-Agent": user_agent,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.7",
+    }
+    try:
+        with httpx.Client(
+            timeout=SEARCH_TIMEOUT,
+            headers=headers,
+            follow_redirects=True,
+        ) as client:
+            if method == "POST":
+                return client.post(DDG_HTML_URL, data={"q": query})
+            return client.get(DDG_HTML_URL, params={"q": query})
+    except Exception as exc:  # noqa: BLE001
+        logger.info("ddg transport error q=%r method=%s: %s", query, method, exc)
+        return None
+
+
 def search_duckduckgo(query: str, max_results: int = 3) -> list[dict[str, str]]:
     """Search DDG's HTML endpoint and return up to ``max_results`` results.
 
     Each result is a dict with ``url``, ``title``, ``snippet``. On any failure
     an empty list is returned.
+
+    Resilience strategy:
+        1. Pick a fresh UA per call (rotates the fingerprint).
+        2. Try POST first; if the response is a throttle code, sleep
+           ``DDG_THROTTLE_BACKOFF`` seconds and fall back to GET.
+        3. Return empty on transport errors or final non-OK status — callers
+           treat that as "no research for this query" and move on.
     """
-    try:
-        with httpx.Client(
-            timeout=SEARCH_TIMEOUT,
-            headers={"User-Agent": DEFAULT_USER_AGENT},
-            follow_redirects=True,
-        ) as client:
-            resp = client.post(DDG_HTML_URL, data={"q": query})
-        resp.raise_for_status()
-    except Exception as exc:  # noqa: BLE001
-        logger.info("ddg search failed q=%r: %s", query, exc)
+    user_agent = random.choice(DDG_USER_AGENTS)
+    resp = _ddg_request(query, user_agent=user_agent, method="POST")
+
+    # On throttle, back off and try the other verb with a fresh UA. DDG appears
+    # to apply different limits to POST vs GET, so verb-switching often clears
+    # us through.
+    if resp is not None and resp.status_code in DDG_THROTTLE_STATUSES:
+        logger.info(
+            "ddg throttle q=%r status=%d; sleeping %.1fs then retrying via GET",
+            query,
+            resp.status_code,
+            DDG_THROTTLE_BACKOFF,
+        )
+        time.sleep(DDG_THROTTLE_BACKOFF)
+        resp = _ddg_request(
+            query, user_agent=random.choice(DDG_USER_AGENTS), method="GET"
+        )
+
+    if resp is None or resp.status_code != 200:
+        status = resp.status_code if resp is not None else "no-response"
+        logger.info("ddg search failed q=%r status=%s", query, status)
         return []
 
     html = resp.text
@@ -261,7 +319,11 @@ def research_event(
     snippet_buf: list[str] = []
     body_buf: list[str] = []
 
-    for query in queries:
+    for i, query in enumerate(queries):
+        # Small jittered pause between queries within a single event so DDG
+        # doesn't see 5 back-to-back requests and trip its anomaly detector.
+        if i > 0:
+            time.sleep(random.uniform(*DDG_INTERQUERY_DELAY))
         results = search_duckduckgo(query, max_results=max_results_per_query)
         if not results:
             continue
