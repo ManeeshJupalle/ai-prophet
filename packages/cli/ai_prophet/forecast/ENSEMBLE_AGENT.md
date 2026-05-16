@@ -213,15 +213,19 @@ With `s = 0`, no change. With `s = 1`, collapse to 0.5. The shrinkage
 factor is *adaptive*:
 
 ```python
-s = BASE_SHRINKAGE * (1 - agreement * 0.5)        # BASE_SHRINKAGE = 0.15
+s = BASE_SHRINKAGE * (1 - agreement * 0.5)        # BASE_SHRINKAGE = 0.10
 agreement = 1 - stdev(p_i) / 0.5                  # 1 = identical, 0 = max spread
 ```
 
+`BASE_SHRINKAGE = 0.10` is the empirically-tuned default, set via the
+self-calibration tool (`python -m ai_prophet.forecast.calibrate`) on a
+19-event resolved sample.
+
 So:
 
-- All three strategies at 0.75 → `agreement ≈ 1.0`, `s ≈ 0.075`. Final
-  result lands near 0.73 — the strategies converged, so shrink less.
-- Strategies at 0.3 / 0.55 / 0.85 → `agreement ≈ 0.55`, `s ≈ 0.11`. Final
+- All three strategies at 0.75 → `agreement ≈ 1.0`, `s ≈ 0.05`. Final
+  result lands near 0.74 — the strategies converged, so shrink less.
+- Strategies at 0.3 / 0.55 / 0.85 → `agreement ≈ 0.55`, `s ≈ 0.07`. Final
   result is pulled noticeably harder toward 0.5 because the spread itself
   is evidence we don't know enough to be confident.
 

@@ -22,8 +22,15 @@ from dataclasses import dataclass
 
 from .strategies.base import Estimate
 
-DEFAULT_SHRINKAGE = 0.15
-"""Maximum shrinkage applied when strategies disagree completely."""
+DEFAULT_SHRINKAGE = 0.10
+"""Maximum shrinkage applied when strategies disagree completely.
+
+Empirically tuned via :mod:`ai_prophet.forecast.calibrate` on a 19-event
+resolved sample: a sweep across ``{0.0, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30,
+0.40}`` produced a flat minimum of Brier ~0.0976 at both 0.10 and 0.15.
+The lower value is preferred because the per-call overconfidence assessment
+flagged YES predictions as slightly under-confident (bias ~−0.07), so less
+shrinkage helps the agent commit when it has a real read."""
 
 CONFIDENCE_FLOOR = 0.15
 """Estimates with confidence at or below this are treated as failed."""
