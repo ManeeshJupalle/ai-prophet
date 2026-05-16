@@ -532,6 +532,11 @@ def _build_app() -> Any:
 
     fastapi_app = FastAPI(title="Ensemble Forecast Agent")
 
+    @fastapi_app.get("/health")
+    async def health() -> dict[str, str]:
+        """Liveness probe for Railway / load-balancer health checks."""
+        return {"status": "ok", "service": "ensemble-forecast-agent"}
+
     @fastapi_app.post("/predict", response_model=PredictionResponse)
     async def predict_endpoint(event: EventRequest) -> PredictionResponse:
         logger.info(
@@ -550,11 +555,17 @@ app = _build_app()
 
 
 def main() -> None:
-    """Run the FastAPI server (development mode)."""
+    """Run the FastAPI server.
+
+    Port resolution order:
+        1. ``PORT`` — set by Railway and most PaaS providers.
+        2. ``ENSEMBLE_PORT`` — local override for dev.
+        3. Fallback ``8000``.
+    """
     import uvicorn
 
     host = os.environ.get("ENSEMBLE_HOST", "0.0.0.0")
-    port = int(os.environ.get("ENSEMBLE_PORT", "8000"))
+    port = int(os.environ.get("PORT", os.environ.get("ENSEMBLE_PORT", "8000")))
     uvicorn.run(
         "ai_prophet.forecast.ensemble_agent:app",
         host=host,

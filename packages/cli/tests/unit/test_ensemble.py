@@ -1088,6 +1088,19 @@ def test_strategy_prompts_omit_temporal_context_when_none() -> None:
     assert "TIME HORIZON" not in rendered
 
 
+def test_health_endpoint_returns_ok() -> None:
+    """GET /health is wired so Railway's liveness probe sees a 200."""
+    from ai_prophet.forecast.ensemble_agent import app
+    from fastapi.testclient import TestClient
+
+    client = TestClient(app)
+    response = client.get("/health")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "ok"
+    assert body["service"] == "ensemble-forecast-agent"
+
+
 def test_forecast_event_threads_temporal_context_to_strategies(
     monkeypatch,
 ) -> None:
