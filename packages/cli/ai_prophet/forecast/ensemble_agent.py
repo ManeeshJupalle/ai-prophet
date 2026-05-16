@@ -25,15 +25,147 @@ from typing import Any
 from pydantic import BaseModel
 
 from .ensemble import FinalPrediction, ensemble_predict
+from .llm_utils import call_llm_json
 from .researcher import research_event
 from .strategies import (
     BaseRateStrategy,
     ContrarianStrategy,
     EvidenceWeightedStrategy,
 )
-from .strategies.base import Estimate, failed_estimate
+from .strategies.base import (
+    Estimate,
+    clamp_confidence,
+    clamp_probability,
+    failed_estimate,
+)
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Deliberation round
+# ---------------------------------------------------------------------------
+
+DELIBERATION_STRATEGY_NAME = "deliberation"
+DELIBERATION_CONFIDENCE = 0.85
+"""Confidence assigned to the deliberation Estimate. It has seen all three
+analysts' rationales, so we trust it more than any single strategy — but not
+so much that it overwhelms strong disagreement among the originals."""
+
+_DELIBERATION_SYSTEM_PROMPT = """You are a meta-forecaster adjudicating among
+three independent analysts' estimates of a binary prediction-market question.
+Each analyst saw the same web research and is calibration-aware, but they
+approach the problem from different angles (evidence-weighted, base-rate,
+contrarian).
+
+Your job is to ADJUDICATE, not average.
+
+Procedure:
+1. Identify which analyst made the strongest argument on THIS specific
+   question. Different question structures favor different analysts:
+   evidence-heavy questions favor the evidence analyst, novel-but-classifiable
+   questions favor the base-rate analyst, consensus-prone questions favor the
+   contrarian.
+2. Spot any reasoning errors or hidden assumptions in the rationales.
+3. Decide where the truth lies. If one analyst clearly dominates, weight your
+   answer toward them. If the strongest analyst is still uncertain, hedge.
+   Do NOT collapse to the simple mean — that defeats the purpose.
+
+Calibration discipline:
+- Probabilities below 0.10 or above 0.90 require an analyst making an
+  overwhelming case that survives scrutiny.
+- If the analysts disagree sharply AND none has a clearly stronger case,
+  the right answer is closer to 0.5 — admit ignorance rather than pick a side.
+
+Respond with ONLY a JSON object:
+{"p_yes": <float 0.01-0.99>,
+ "winner": "<strategy name with the strongest case, or 'none' if all weak>",
+ "rationale": "<2-3 sentences: which case won and why; flag mistakes the
+ others made>"}
+
+No prose, no markdown fences, no commentary."""
+
+
+def _deliberation_enabled() -> bool:
+    """Read ``ENABLE_DELIBERATION`` from the env; default ``True``.
+
+    Explicit disables: ``false``, ``0``, ``no``, ``off``, empty string.
+    Anything else (including missing) → enabled.
+    """
+    raw = os.environ.get("ENABLE_DELIBERATION", "true").strip().lower()
+    return raw not in {"false", "0", "no", "off", ""}
+
+
+def _build_deliberation_prompt(
+    event: EventRequest, estimates: list[Estimate]
+) -> str:
+    lines = [f"Event: {event.title}"]
+    if event.outcomes and len(event.outcomes) >= 2:
+        lines.append(
+            f"OUTCOMES: YES = {event.outcomes[0]}, NO = {event.outcomes[1]}"
+        )
+    if event.category:
+        lines.append(f"Category: {event.category}")
+    if event.rules:
+        lines.append(f"Resolution rules: {event.rules}")
+    lines.append("")
+    lines.append("Three independent estimates from the analysts:")
+    lines.append("")
+    for i, est in enumerate(estimates, 1):
+        lines.append(
+            f"{i}) {est.strategy}  p_yes={est.p_yes:.3f}  "
+            f"confidence={est.confidence:.2f}"
+        )
+        lines.append(f"   Rationale: {est.rationale}")
+        lines.append("")
+    lines.append(
+        "Adjudicate. Which analyst is most convincing on THIS specific "
+        "question? Where does the final probability land? Return the JSON "
+        "object only."
+    )
+    return "\n".join(lines)
+
+
+def _deliberate(
+    event: EventRequest, estimates: list[Estimate]
+) -> Estimate | None:
+    """Run one meta-LLM pass over the strategies' estimates.
+
+    Returns a fourth :class:`Estimate` with ``strategy="deliberation"`` and
+    confidence :data:`DELIBERATION_CONFIDENCE`, or ``None`` if the call fails
+    or the LLM returned an unparseable payload. The caller treats ``None`` as
+    "skip the deliberation round; proceed with the three originals."
+    """
+    if not estimates:
+        return None
+    user_prompt = _build_deliberation_prompt(event, estimates)
+    try:
+        data = call_llm_json(
+            _DELIBERATION_SYSTEM_PROMPT,
+            user_prompt,
+            tier="reasoning",
+            temperature=0.2,
+            max_tokens=500,
+        )
+    except Exception as exc:  # noqa: BLE001 — never break the pipeline
+        logger.warning("deliberation LLM call failed: %s", exc)
+        return None
+
+    try:
+        p = clamp_probability(float(data["p_yes"]))
+        rationale = str(data.get("rationale", "")).strip() or "(no rationale)"
+        winner = str(data.get("winner", "")).strip()
+    except (KeyError, TypeError, ValueError) as exc:
+        logger.warning("deliberation bad payload: %s", exc)
+        return None
+
+    if winner:
+        rationale = f"[winner: {winner}] {rationale}"
+    return Estimate(
+        p_yes=p,
+        rationale=rationale,
+        strategy=DELIBERATION_STRATEGY_NAME,
+        confidence=clamp_confidence(DELIBERATION_CONFIDENCE),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -179,6 +311,30 @@ def forecast_event(event: EventRequest) -> FinalPrediction:
             est.p_yes,
             est.confidence,
         )
+
+    # Phase 2.5: optional deliberation round — one meta-LLM call adjudicates
+    # over the three analysts' estimates and produces a fourth estimate.
+    if _deliberation_enabled():
+        delib_start = time.perf_counter()
+        delib = _deliberate(event, estimates)
+        delib_elapsed = time.perf_counter() - delib_start
+        if delib is not None:
+            estimates.append(delib)
+            logger.info(
+                "phase=deliberation ticker=%s p=%.3f conf=%.2f elapsed=%.2fs",
+                event.market_ticker,
+                delib.p_yes,
+                delib.confidence,
+                delib_elapsed,
+            )
+        else:
+            logger.info(
+                "phase=deliberation ticker=%s skipped (call failed) elapsed=%.2fs",
+                event.market_ticker,
+                delib_elapsed,
+            )
+    else:
+        logger.debug("phase=deliberation disabled via ENABLE_DELIBERATION")
 
     # Phase 3: ensemble + calibration
     ens_start = time.perf_counter()

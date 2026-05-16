@@ -526,3 +526,209 @@ def test_strategy_prompt_omits_outcomes_line_when_missing() -> None:
             outcomes=outcomes,
         )
         assert "OUTCOMES:" not in rendered
+
+
+# ---------------------------------------------------------------------------
+# Deliberation round
+# ---------------------------------------------------------------------------
+
+
+def _fake_strategy_estimates() -> dict[str, Estimate]:
+    return {
+        "evidence_weighted": Estimate(
+            p_yes=0.70, rationale="ew", strategy="evidence_weighted", confidence=0.70
+        ),
+        "base_rate": Estimate(
+            p_yes=0.65, rationale="br", strategy="base_rate", confidence=0.60
+        ),
+        "contrarian": Estimate(
+            p_yes=0.75, rationale="co", strategy="contrarian", confidence=0.70
+        ),
+    }
+
+
+def test_deliberation_enabled_flag_parsing(monkeypatch) -> None:
+    """ENABLE_DELIBERATION env var parses correctly."""
+    from ai_prophet.forecast.ensemble_agent import _deliberation_enabled
+
+    monkeypatch.delenv("ENABLE_DELIBERATION", raising=False)
+    assert _deliberation_enabled() is True  # default
+
+    for val in ("false", "FALSE", "0", "no", "off", ""):
+        monkeypatch.setenv("ENABLE_DELIBERATION", val)
+        assert _deliberation_enabled() is False, f"{val!r} should disable"
+
+    for val in ("true", "TRUE", "1", "yes", "on", "anything"):
+        monkeypatch.setenv("ENABLE_DELIBERATION", val)
+        assert _deliberation_enabled() is True, f"{val!r} should enable"
+
+
+def test_deliberation_called_and_added_to_ensemble(monkeypatch) -> None:
+    """When enabled, _deliberate runs after strategies and its estimate is in the ensemble."""
+    from ai_prophet.forecast import ensemble_agent
+
+    monkeypatch.setenv("ENABLE_DELIBERATION", "true")
+    monkeypatch.setattr(ensemble_agent, "research_event", lambda **_kw: "")
+
+    table = _fake_strategy_estimates()
+    monkeypatch.setattr(
+        ensemble_agent,
+        "_run_strategy",
+        lambda strategy, event, research: table[strategy.name],
+    )
+
+    captured_calls: list[list[Estimate]] = []
+
+    def fake_deliberate(event, estimates):
+        captured_calls.append(list(estimates))
+        return Estimate(
+            p_yes=0.72, rationale="meta", strategy="deliberation", confidence=0.85
+        )
+
+    monkeypatch.setattr(ensemble_agent, "_deliberate", fake_deliberate)
+
+    event = ensemble_agent.EventRequest(title="test event")
+    final = ensemble_agent.forecast_event(event)
+
+    # Deliberation was called exactly once
+    assert len(captured_calls) == 1
+    # ... with the three strategy estimates as input
+    assert len(captured_calls[0]) == 3
+    assert {e.strategy for e in captured_calls[0]} == {
+        "evidence_weighted",
+        "base_rate",
+        "contrarian",
+    }
+    # Final ensemble includes all four estimates
+    assert len(final.estimates) == 4
+    assert "deliberation" in {e.strategy for e in final.estimates}
+
+
+def test_deliberation_skipped_when_env_false(monkeypatch) -> None:
+    """ENABLE_DELIBERATION=false skips the deliberation round entirely."""
+    from ai_prophet.forecast import ensemble_agent
+
+    monkeypatch.setenv("ENABLE_DELIBERATION", "false")
+    monkeypatch.setattr(ensemble_agent, "research_event", lambda **_kw: "")
+
+    table = _fake_strategy_estimates()
+    monkeypatch.setattr(
+        ensemble_agent,
+        "_run_strategy",
+        lambda strategy, event, research: table[strategy.name],
+    )
+
+    invocations: list[bool] = []
+
+    def fake_deliberate(event, estimates):
+        invocations.append(True)
+        return None
+
+    monkeypatch.setattr(ensemble_agent, "_deliberate", fake_deliberate)
+
+    event = ensemble_agent.EventRequest(title="test event")
+    final = ensemble_agent.forecast_event(event)
+
+    assert invocations == []  # _deliberate never called
+    assert len(final.estimates) == 3
+    assert "deliberation" not in {e.strategy for e in final.estimates}
+
+
+def test_deliberation_failure_falls_back_to_three_estimates(monkeypatch) -> None:
+    """When _deliberate returns None, the ensemble proceeds on the 3 originals."""
+    from ai_prophet.forecast import ensemble_agent
+
+    monkeypatch.setenv("ENABLE_DELIBERATION", "true")
+    monkeypatch.setattr(ensemble_agent, "research_event", lambda **_kw: "")
+
+    table = _fake_strategy_estimates()
+    monkeypatch.setattr(
+        ensemble_agent,
+        "_run_strategy",
+        lambda strategy, event, research: table[strategy.name],
+    )
+    monkeypatch.setattr(
+        ensemble_agent, "_deliberate", lambda event, estimates: None
+    )
+
+    event = ensemble_agent.EventRequest(title="test event")
+    final = ensemble_agent.forecast_event(event)
+
+    assert len(final.estimates) == 3
+    assert "deliberation" not in {e.strategy for e in final.estimates}
+
+
+def test_deliberate_uses_reasoning_tier_and_includes_outcomes(monkeypatch) -> None:
+    """_deliberate routes to the reasoning tier and surfaces outcomes in the prompt."""
+    from ai_prophet.forecast import ensemble_agent
+
+    captured: list[dict] = []
+
+    def fake_call(system, user, *, tier, temperature, max_tokens):
+        captured.append({"tier": tier, "system": system, "user": user})
+        return {
+            "p_yes": 0.6,
+            "rationale": "stub",
+            "winner": "evidence_weighted",
+        }
+
+    monkeypatch.setattr(ensemble_agent, "call_llm_json", fake_call)
+
+    event = ensemble_agent.EventRequest(
+        title="Will Lakers beat Thunder?",
+        outcomes=["Lakers", "Thunder"],
+    )
+    estimates = [
+        Estimate(p_yes=0.7, rationale="r1", strategy="evidence_weighted", confidence=0.7),
+        Estimate(p_yes=0.5, rationale="r2", strategy="base_rate", confidence=0.6),
+        Estimate(p_yes=0.4, rationale="r3", strategy="contrarian", confidence=0.5),
+    ]
+    delib = ensemble_agent._deliberate(event, estimates)
+
+    assert delib is not None
+    assert delib.strategy == "deliberation"
+    assert delib.p_yes == pytest.approx(0.6)
+    assert delib.confidence == pytest.approx(0.85)
+    assert len(captured) == 1
+    assert captured[0]["tier"] == "reasoning"
+    # Prompt surfaces the OUTCOMES line and every strategy by name.
+    user = captured[0]["user"]
+    assert "OUTCOMES: YES = Lakers, NO = Thunder" in user
+    for name in ("evidence_weighted", "base_rate", "contrarian"):
+        assert name in user
+    # Winner is captured in the rationale prefix.
+    assert "winner: evidence_weighted" in delib.rationale
+
+
+def test_deliberate_returns_none_on_llm_failure(monkeypatch) -> None:
+    """An LLM exception during deliberation returns None, not a crash."""
+    from ai_prophet.forecast import ensemble_agent
+    from ai_prophet.forecast.llm_utils import LLMError
+
+    def boom(*_args, **_kwargs):
+        raise LLMError("simulated chain failure")
+
+    monkeypatch.setattr(ensemble_agent, "call_llm_json", boom)
+
+    event = ensemble_agent.EventRequest(title="t")
+    estimates = [
+        Estimate(p_yes=0.5, rationale="r", strategy="x", confidence=0.5),
+    ]
+    assert ensemble_agent._deliberate(event, estimates) is None
+
+
+def test_deliberate_returns_none_on_bad_payload(monkeypatch) -> None:
+    """An LLM response missing p_yes returns None."""
+    from ai_prophet.forecast import ensemble_agent
+
+    monkeypatch.setattr(
+        ensemble_agent,
+        "call_llm_json",
+        lambda *_a, **_kw: {"rationale": "no p_yes"},
+    )
+
+    event = ensemble_agent.EventRequest(title="t")
+    estimates = [
+        Estimate(p_yes=0.5, rationale="r", strategy="x", confidence=0.5),
+    ]
+    assert ensemble_agent._deliberate(event, estimates) is None
