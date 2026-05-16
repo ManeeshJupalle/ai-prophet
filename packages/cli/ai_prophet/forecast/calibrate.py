@@ -39,6 +39,11 @@ from .strategies import (
     EvidenceWeightedStrategy,
 )
 from .strategies.base import Estimate, failed_estimate
+from .temporal import (
+    hours_until_close,
+    temporal_context_string,
+    temporal_factor,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -221,7 +226,9 @@ def tune_shrinkage(
 # ---------------------------------------------------------------------------
 
 
-def _run_one_strategy(strategy: Any, event: Any, research: str) -> Estimate:
+def _run_one_strategy(
+    strategy: Any, event: Any, research: str, temporal_ctx: str | None = None
+) -> Estimate:
     try:
         return strategy.estimate(
             title=event.title,
@@ -231,6 +238,7 @@ def _run_one_strategy(strategy: Any, event: Any, research: str) -> Estimate:
             close_time=event.close_time,
             research=research,
             outcomes=event.outcomes,
+            temporal_context=temporal_ctx,
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning(
@@ -244,10 +252,16 @@ def predict_event_full(event_dict: dict[str, Any]) -> dict[str, Any]:
 
     The event's ``resolved_outcome`` is force-cleared so the agent runs
     blind — we want to measure how it *would have* performed if the answer
-    weren't already known.
+    weren't already known. Temporal context is computed from
+    ``close_time`` and threaded through strategies + ensemble identically
+    to the production pipeline.
     """
     blind = {**event_dict, "resolved_outcome": None}
     event_req = _coerce_event(blind)
+
+    hours = hours_until_close(event_req.close_time)
+    factor = temporal_factor(hours)
+    temporal_ctx = temporal_context_string(hours)
 
     research = research_event(
         title=event_req.title,
@@ -264,12 +278,13 @@ def predict_event_full(event_dict: dict[str, Any]) -> dict[str, Any]:
     estimates: list[Estimate] = []
     with ThreadPoolExecutor(max_workers=len(strategies)) as pool:
         futures = [
-            pool.submit(_run_one_strategy, s, event_req, research) for s in strategies
+            pool.submit(_run_one_strategy, s, event_req, research, temporal_ctx)
+            for s in strategies
         ]
         for fut in futures:
             estimates.append(fut.result())
 
-    final = ensemble_predict(estimates)
+    final = ensemble_predict(estimates, temporal_factor=factor)
     return {
         "estimates": [
             {

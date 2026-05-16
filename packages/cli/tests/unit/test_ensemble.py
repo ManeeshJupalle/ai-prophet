@@ -580,12 +580,12 @@ def test_deliberation_called_and_added_to_ensemble(monkeypatch) -> None:
     monkeypatch.setattr(
         ensemble_agent,
         "_run_strategy",
-        lambda strategy, event, research: table[strategy.name],
+        lambda strategy, event, research, temporal_ctx=None: table[strategy.name],
     )
 
     captured_calls: list[list[Estimate]] = []
 
-    def fake_deliberate(event, estimates):
+    def fake_deliberate(event, estimates, temporal_ctx=None):
         captured_calls.append(list(estimates))
         return Estimate(
             p_yes=0.72, rationale="meta", strategy="deliberation", confidence=0.85
@@ -621,7 +621,7 @@ def test_deliberation_skipped_when_env_false(monkeypatch) -> None:
     monkeypatch.setattr(
         ensemble_agent,
         "_run_strategy",
-        lambda strategy, event, research: table[strategy.name],
+        lambda strategy, event, research, temporal_ctx=None: table[strategy.name],
     )
 
     invocations: list[bool] = []
@@ -651,10 +651,12 @@ def test_deliberation_failure_falls_back_to_three_estimates(monkeypatch) -> None
     monkeypatch.setattr(
         ensemble_agent,
         "_run_strategy",
-        lambda strategy, event, research: table[strategy.name],
+        lambda strategy, event, research, temporal_ctx=None: table[strategy.name],
     )
     monkeypatch.setattr(
-        ensemble_agent, "_deliberate", lambda event, estimates: None
+        ensemble_agent,
+        "_deliberate",
+        lambda event, estimates, temporal_ctx=None: None,
     )
 
     event = ensemble_agent.EventRequest(title="test event")
@@ -972,3 +974,156 @@ def test_predict_cache_hit_skips_pacing_sleep(monkeypatch, tmp_path) -> None:
 
     ensemble_agent.predict({"market_ticker": "FAST", "title": "t"})
     assert sleeps == []
+
+
+# ---------------------------------------------------------------------------
+# Temporal factor integration with the ensemble
+# ---------------------------------------------------------------------------
+
+
+def test_ensemble_predict_with_temporal_factor_changes_shrinkage() -> None:
+    """temporal_factor scales the base shrinkage before agreement adjustment."""
+    # Strategies disagree (so agreement-based shrinkage doesn't dominate).
+    estimates = [
+        _est(0.20, 0.7, "a"),
+        _est(0.55, 0.7, "b"),
+        _est(0.85, 0.7, "c"),
+    ]
+    no_temporal = ensemble_predict(estimates, base_shrinkage=0.20)
+    imminent = ensemble_predict(estimates, base_shrinkage=0.20, temporal_factor=1.0)
+    far = ensemble_predict(estimates, base_shrinkage=0.20, temporal_factor=0.3)
+
+    # Imminent → less shrinkage than the no-temporal baseline.
+    assert imminent.shrinkage < no_temporal.shrinkage
+    # Far → slightly less than baseline too (factor 0.3 still trims base),
+    # but more shrinkage than the imminent case.
+    assert far.shrinkage > imminent.shrinkage
+    assert far.shrinkage <= no_temporal.shrinkage
+
+
+def test_ensemble_predict_imminent_more_decisive_than_far() -> None:
+    """For the same disagreeing estimates, imminent stays closer to raw_p."""
+    # Estimates lean YES (mean > 0.5) so less shrinkage → result is further from 0.5.
+    estimates = [
+        _est(0.85, 0.7, "a"),
+        _est(0.80, 0.7, "b"),
+        _est(0.40, 0.7, "c"),
+    ]
+    imminent = ensemble_predict(estimates, base_shrinkage=0.20, temporal_factor=1.0)
+    far = ensemble_predict(estimates, base_shrinkage=0.20, temporal_factor=0.3)
+
+    # Imminent should be further from 0.5 than far (less shrinkage applied).
+    assert abs(imminent.p_yes - 0.5) > abs(far.p_yes - 0.5)
+
+
+def test_ensemble_predict_clamps_invalid_temporal_factor() -> None:
+    """Out-of-range temporal_factor is clamped to [0, 1]."""
+    estimates = [_est(0.8, 0.8, "x")]
+    a = ensemble_predict(estimates, base_shrinkage=0.20, temporal_factor=2.0)
+    b = ensemble_predict(estimates, base_shrinkage=0.20, temporal_factor=1.0)
+    # Both should produce the same effective shrinkage.
+    assert a.shrinkage == pytest.approx(b.shrinkage)
+
+    c = ensemble_predict(estimates, base_shrinkage=0.20, temporal_factor=-0.5)
+    d = ensemble_predict(estimates, base_shrinkage=0.20, temporal_factor=0.0)
+    assert c.shrinkage == pytest.approx(d.shrinkage)
+
+
+def test_ensemble_predict_default_temporal_matches_legacy_behaviour() -> None:
+    """Omitting temporal_factor produces the same result as before this feature."""
+    estimates = [
+        _est(0.7, 0.6, "a"),
+        _est(0.65, 0.6, "b"),
+        _est(0.75, 0.6, "c"),
+    ]
+    without = ensemble_predict(estimates, base_shrinkage=0.15)
+    # Manually compute legacy shrinkage = base * (1 - agreement * 0.5)
+    assert without.shrinkage == pytest.approx(
+        0.15 * (1.0 - without.agreement * 0.5), abs=1e-9
+    )
+
+
+def test_strategy_prompts_include_temporal_context_when_provided() -> None:
+    """All three strategies inject the temporal_context line into the user prompt."""
+    from ai_prophet.forecast.strategies.base_rate import (
+        _build_user_prompt as base_rate_prompt,
+    )
+    from ai_prophet.forecast.strategies.contrarian import (
+        _build_user_prompt as contrarian_prompt,
+    )
+    from ai_prophet.forecast.strategies.evidence import (
+        _build_user_prompt as evidence_prompt,
+    )
+
+    ctx = "TIME HORIZON: this event closes in 6 hours. Be decisive."
+    kwargs = {
+        "title": "t",
+        "description": None,
+        "category": "Sports",
+        "rules": None,
+        "close_time": None,
+        "research": "",
+        "outcomes": ["A", "B"],
+        "temporal_context": ctx,
+    }
+    for fn in (evidence_prompt, base_rate_prompt, contrarian_prompt):
+        rendered = fn(**kwargs)
+        assert ctx in rendered
+
+
+def test_strategy_prompts_omit_temporal_context_when_none() -> None:
+    """A None temporal_context leaves no TIME HORIZON line in the prompt."""
+    from ai_prophet.forecast.strategies.evidence import _build_user_prompt
+
+    rendered = _build_user_prompt(
+        title="t",
+        description=None,
+        category=None,
+        rules=None,
+        close_time=None,
+        research="",
+        outcomes=None,
+        temporal_context=None,
+    )
+    assert "TIME HORIZON" not in rendered
+
+
+def test_forecast_event_threads_temporal_context_to_strategies(
+    monkeypatch,
+) -> None:
+    """forecast_event computes temporal context and passes it to every strategy."""
+    from ai_prophet.forecast import ensemble_agent
+
+    monkeypatch.setenv("ENABLE_DELIBERATION", "false")
+    monkeypatch.setattr(ensemble_agent, "research_event", lambda **_kw: "")
+
+    captured: list[dict] = []
+
+    def capturing_run(strategy, event, research, temporal_ctx=None):
+        captured.append(
+            {"strategy": strategy.name, "temporal_ctx": temporal_ctx}
+        )
+        return Estimate(
+            p_yes=0.6,
+            rationale="r",
+            strategy=strategy.name,
+            confidence=0.6,
+        )
+
+    monkeypatch.setattr(ensemble_agent, "_run_strategy", capturing_run)
+
+    # Event closing in ~6 hours → imminent bucket.
+    from datetime import UTC, datetime, timedelta
+
+    close_iso = (datetime.now(UTC) + timedelta(hours=6)).isoformat()
+    event = ensemble_agent.EventRequest(title="t", close_time=close_iso)
+    ensemble_agent.forecast_event(event)
+
+    # All three strategies got the same non-None temporal context.
+    assert len(captured) == 3
+    ctxs = {c["temporal_ctx"] for c in captured}
+    assert len(ctxs) == 1  # all received the same string
+    ctx = next(iter(ctxs))
+    assert ctx is not None
+    assert "TIME HORIZON" in ctx
+    assert "imminent" in ctx.lower()

@@ -38,6 +38,7 @@ class Strategy(Protocol):
         close_time: str | None,
         research: str,
         outcomes: list[str] | None = None,
+        temporal_context: str | None = None,
     ) -> Estimate: ...
 
 

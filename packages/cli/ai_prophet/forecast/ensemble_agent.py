@@ -39,6 +39,11 @@ from .strategies.base import (
     clamp_probability,
     failed_estimate,
 )
+from .temporal import (
+    hours_until_close,
+    temporal_context_string,
+    temporal_factor,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -97,7 +102,9 @@ def _deliberation_enabled() -> bool:
 
 
 def _build_deliberation_prompt(
-    event: EventRequest, estimates: list[Estimate]
+    event: EventRequest,
+    estimates: list[Estimate],
+    temporal_ctx: str | None = None,
 ) -> str:
     lines = [f"Event: {event.title}"]
     if event.outcomes and len(event.outcomes) >= 2:
@@ -108,6 +115,8 @@ def _build_deliberation_prompt(
         lines.append(f"Category: {event.category}")
     if event.rules:
         lines.append(f"Resolution rules: {event.rules}")
+    if temporal_ctx:
+        lines.append(temporal_ctx)
     lines.append("")
     lines.append("Three independent estimates from the analysts:")
     lines.append("")
@@ -127,7 +136,9 @@ def _build_deliberation_prompt(
 
 
 def _deliberate(
-    event: EventRequest, estimates: list[Estimate]
+    event: EventRequest,
+    estimates: list[Estimate],
+    temporal_ctx: str | None = None,
 ) -> Estimate | None:
     """Run one meta-LLM pass over the strategies' estimates.
 
@@ -138,7 +149,7 @@ def _deliberate(
     """
     if not estimates:
         return None
-    user_prompt = _build_deliberation_prompt(event, estimates)
+    user_prompt = _build_deliberation_prompt(event, estimates, temporal_ctx)
     try:
         data = call_llm_json(
             _DELIBERATION_SYSTEM_PROMPT,
@@ -254,7 +265,12 @@ def _resolved_outcome_value(raw: Any) -> str | None:
     return None
 
 
-def _run_strategy(strategy: Any, event: EventRequest, research: str) -> Estimate:
+def _run_strategy(
+    strategy: Any,
+    event: EventRequest,
+    research: str,
+    temporal_ctx: str | None = None,
+) -> Estimate:
     try:
         return strategy.estimate(
             title=event.title,
@@ -264,6 +280,7 @@ def _run_strategy(strategy: Any, event: EventRequest, research: str) -> Estimate
             close_time=event.close_time,
             research=research,
             outcomes=event.outcomes,
+            temporal_context=temporal_ctx,
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning("strategy %s crashed: %s", getattr(strategy, "name", "?"), exc)
@@ -273,6 +290,20 @@ def _run_strategy(strategy: Any, event: EventRequest, research: str) -> Estimate
 def forecast_event(event: EventRequest) -> FinalPrediction:
     """Run the full ensemble pipeline for one event and return its prediction."""
     overall_start = time.perf_counter()
+
+    # Compute temporal context once and pass it everywhere downstream:
+    # strategies see the time-horizon sentence, deliberation sees it, and
+    # ensemble_predict scales its base shrinkage by the factor (imminent
+    # events get less shrinkage and so a more decisive final p_yes).
+    hours = hours_until_close(event.close_time)
+    factor = temporal_factor(hours)
+    temporal_ctx = temporal_context_string(hours)
+    logger.info(
+        "phase=temporal ticker=%s hours=%s factor=%.2f",
+        event.market_ticker,
+        f"{hours:.1f}" if hours is not None else "unknown",
+        factor,
+    )
 
     # Phase 1: research
     research_start = time.perf_counter()
@@ -295,7 +326,8 @@ def forecast_event(event: EventRequest) -> FinalPrediction:
     estimates: list[Estimate] = []
     with ThreadPoolExecutor(max_workers=len(strategies)) as pool:
         futures = {
-            pool.submit(_run_strategy, s, event, research): s for s in strategies
+            pool.submit(_run_strategy, s, event, research, temporal_ctx): s
+            for s in strategies
         }
         for fut in as_completed(futures):
             estimates.append(fut.result())
@@ -317,7 +349,7 @@ def forecast_event(event: EventRequest) -> FinalPrediction:
     # over the three analysts' estimates and produces a fourth estimate.
     if _deliberation_enabled():
         delib_start = time.perf_counter()
-        delib = _deliberate(event, estimates)
+        delib = _deliberate(event, estimates, temporal_ctx)
         delib_elapsed = time.perf_counter() - delib_start
         if delib is not None:
             estimates.append(delib)
@@ -337,15 +369,17 @@ def forecast_event(event: EventRequest) -> FinalPrediction:
     else:
         logger.debug("phase=deliberation disabled via ENABLE_DELIBERATION")
 
-    # Phase 3: ensemble + calibration
+    # Phase 3: ensemble + calibration (temporal-aware shrinkage)
     ens_start = time.perf_counter()
-    final = ensemble_predict(estimates)
+    final = ensemble_predict(estimates, temporal_factor=factor)
     logger.info(
-        "phase=ensemble ticker=%s p_yes=%.3f agreement=%.2f shrinkage=%.2f elapsed=%.2fs",
+        "phase=ensemble ticker=%s p_yes=%.3f agreement=%.2f shrinkage=%.2f "
+        "temporal_factor=%.2f elapsed=%.2fs",
         event.market_ticker,
         final.p_yes,
         final.agreement,
         final.shrinkage,
+        factor,
         time.perf_counter() - ens_start,
     )
     logger.info(

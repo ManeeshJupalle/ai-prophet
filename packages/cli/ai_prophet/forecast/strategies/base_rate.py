@@ -60,6 +60,7 @@ def _build_user_prompt(
     close_time: str | None,
     research: str,
     outcomes: list[str] | None = None,
+    temporal_context: str | None = None,
 ) -> str:
     lines = [
         f"Today: {date.today().isoformat()}",
@@ -75,6 +76,8 @@ def _build_user_prompt(
         lines.append(f"Resolution rules: {rules}")
     if close_time:
         lines.append(f"Market closes at: {close_time}")
+    if temporal_context:
+        lines.append(temporal_context)
     lines.append("")
     lines.append("Research brief (use to identify reference class and adjust):")
     lines.append(research if research else "(no research available)")
@@ -101,6 +104,7 @@ class BaseRateStrategy:
         close_time: str | None = None,
         research: str = "",
         outcomes: list[str] | None = None,
+        temporal_context: str | None = None,
     ) -> Estimate:
         user = _build_user_prompt(
             title=title,
@@ -110,6 +114,7 @@ class BaseRateStrategy:
             close_time=close_time,
             research=research,
             outcomes=outcomes,
+            temporal_context=temporal_context,
         )
         try:
             data = call_llm_json(

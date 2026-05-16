@@ -142,18 +142,29 @@ def ensemble_predict(
     estimates: Iterable[Estimate],
     *,
     base_shrinkage: float = DEFAULT_SHRINKAGE,
+    temporal_factor: float | None = None,
 ) -> FinalPrediction:
     """Combine strategy estimates into a final calibrated prediction.
 
     Steps:
         1. Drop estimates with confidence ≤ :data:`CONFIDENCE_FLOOR`.
         2. Confidence-weighted average in log-odds space.
-        3. Apply adaptive shrinkage:
-           ``shrinkage = base_shrinkage * (1 - agreement * 0.5)``.
+        3. Apply adaptive shrinkage. If ``temporal_factor`` is provided
+           (in ``[0, 1]``, where 1.0 means imminent and 0.3 means far
+           future), the base shrinkage is first scaled down by
+           ``(1 - temporal_factor * 0.5)`` — imminent events get less
+           shrinkage so the agent is more decisive; far events get nearly
+           full base shrinkage so the agent hedges. The agreement adjustment
+           then multiplies that effective base by ``(1 - agreement * 0.5)``.
         4. Clamp to ``[P_MIN, P_MAX]``.
     """
     estimates = list(estimates)
     usable = [e for e in estimates if e.confidence > CONFIDENCE_FLOOR]
+
+    effective_base = base_shrinkage
+    if temporal_factor is not None:
+        f = max(0.0, min(1.0, temporal_factor))
+        effective_base = base_shrinkage * (1.0 - f * 0.5)
 
     # If everything was filtered out, fall back to maximum-uncertainty.
     if not usable:
@@ -173,13 +184,13 @@ def ensemble_predict(
             rationale=rationale,
             raw_p_yes=0.5,
             agreement=0.0,
-            shrinkage=base_shrinkage,
+            shrinkage=effective_base,
             estimates=[],
         )
 
     raw_p = confidence_weighted_ensemble(usable)
     agreement = compute_agreement(usable)
-    shrinkage = base_shrinkage * (1.0 - agreement * 0.5)
+    shrinkage = effective_base * (1.0 - agreement * 0.5)
     calibrated = calibrate(raw_p, shrinkage)
     final_p = max(P_MIN, min(P_MAX, calibrated))
 
