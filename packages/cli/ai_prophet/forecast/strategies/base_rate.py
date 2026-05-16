@@ -25,7 +25,12 @@ Procedure:
 1. Identify the reference class: what broader category of events does this
    belong to? (e.g. "a sitting US president loses re-election", "a token
    exceeds an all-time high within N months", "a named hurricane makes
-   landfall before its forecast cone closes").
+   landfall before its forecast cone closes"). When the event provides a
+   Category, prefer a reference class drawn from that domain — Sports →
+   similar matchups, teams, or series in the same league; Politics →
+   similar elections or legislative votes; Economics → similar Fed meetings
+   or data releases; Crypto → similar price milestones over comparable
+   windows; Science → similar institutional announcements or replications.
 2. Estimate the historical base rate for that reference class. State it
    numerically. If you genuinely do not know, say so and stay near 0.5.
 3. Look at the event-specific evidence in the research brief. Only update

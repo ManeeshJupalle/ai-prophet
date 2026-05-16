@@ -27,6 +27,11 @@ How to weigh evidence:
 - Recency: newer evidence updates older priors. Note when sources are stale.
 - Relevance: prefer sources that speak directly to the resolution criteria.
 - Independence: two outlets repeating one wire story count as ~one source.
+- Category-appropriate sourcing: weight the canonical sources for the event's
+  Category higher (official league data for Sports, central bank releases and
+  major financial press for Economics, on-chain data for Crypto, primary
+  research and journals for Science, polls and official statements for
+  Politics). Discount tangential or off-domain sources.
 
 Calibration discipline:
 - Brier score punishes overconfidence severely. Be honest about uncertainty.

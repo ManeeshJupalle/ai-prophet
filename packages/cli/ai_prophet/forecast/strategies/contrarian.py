@@ -30,6 +30,12 @@ Procedure:
    - Selection bias in the sources driving consensus.
    - Recency bias — does a recent dramatic event distort the view?
    - Ambiguity in the resolution criteria that could flip the outcome.
+   - Category-specific biases to stress-test: in Sports, recency bias from
+     one dramatic recent game and over-reliance on betting market odds; in
+     Politics, poll sample skew and the late-undecided shift; in Crypto,
+     hype-driven sentiment and influencer-coordinated moves; in Economics,
+     anchoring to the latest data print over fundamental trends; in
+     Science, publication bias and replication uncertainty.
 3. Decide where you land. If the case for the consensus survives this
    stress test, your estimate moves only modestly from consensus. If the
    case is weak, push your probability back toward 0.5 — uncertainty beats

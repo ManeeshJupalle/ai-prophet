@@ -75,10 +75,90 @@ outcome. Each query should target a distinct angle: current status / recent
 news, historical base rate or expert commentary, and contradictory or risk-
 oriented information.
 
+If the user prompt provides a CATEGORY HINT, treat it as authoritative
+guidance about which kinds of sources to look for. Generate queries that
+will surface those source types specifically.
+
 Respond with ONLY a JSON object of the form:
 {"queries": ["query 1", "query 2", "query 3"]}
 
 No prose, no markdown fences, no commentary."""
+
+
+# Category-specific search guidance. The matching hint is injected into the
+# query-generation prompt so the LLM produces category-appropriate queries
+# (scores/standings for Sports, Fed statements for Economics, polls for
+# Politics, etc.). Keys match by exact case AND case-insensitive title-case
+# normalization, so "sports", "Sports", and "SPORTS" all resolve.
+CATEGORY_HINTS: dict[str, str] = {
+    "Sports": (
+        "Search for recent game scores, standings, player injuries, "
+        "head-to-head records, and betting odds."
+    ),
+    "Economics": (
+        "Search for central bank statements, economic indicators, market "
+        "data, analyst forecasts, and policy announcements."
+    ),
+    "Politics": (
+        "Search for recent polls, legislative votes, political analysis, "
+        "official statements, and election data."
+    ),
+    "Technology": (
+        "Search for product announcements, company earnings, industry "
+        "reports, and expert analysis."
+    ),
+    "Science": (
+        "Search for research publications, expert commentary, "
+        "institutional announcements, and peer review status."
+    ),
+    "Crypto": (
+        "Search for current prices, trading volume, regulatory news, "
+        "on-chain metrics, and market sentiment."
+    ),
+    "Weather": (
+        "Search for official weather forecasts, historical climate data, "
+        "and meteorological service predictions."
+    ),
+}
+
+DEFAULT_CATEGORY_HINT = (
+    "Search for authoritative recent sources on the topic, expert "
+    "commentary, historical precedents for similar questions, and any "
+    "evidence that contradicts the consensus view."
+)
+
+
+def hint_for_category(category: str | None) -> str:
+    """Return the category-specific search hint, or the generic fallback.
+
+    Lookup is case-insensitive against :data:`CATEGORY_HINTS` keys, so
+    ``"sports"``, ``"Sports"``, and ``"SPORTS"`` all resolve to the same hint.
+    Unknown or missing categories receive :data:`DEFAULT_CATEGORY_HINT`.
+    """
+    if not category:
+        return DEFAULT_CATEGORY_HINT
+    normalized = category.strip().title()
+    return CATEGORY_HINTS.get(normalized, DEFAULT_CATEGORY_HINT)
+
+
+def _build_query_user_prompt(
+    title: str, description: str | None, category: str | None
+) -> str:
+    """Compose the user prompt fed to the query-generation LLM call."""
+    parts = [f"Event title: {title}"]
+    if category:
+        parts.append(f"Category: {category}")
+    if description:
+        parts.append(f"Description: {description}")
+    parts.append(f"Today: {date.today().isoformat()}")
+    parts.append(f"\nCATEGORY HINT: {hint_for_category(category)}")
+    parts.append(
+        f"\nReturn {MAX_SEARCH_QUERIES} distinct, well-formed search queries "
+        "that, together, would ground a forecast on this event. Honor the "
+        "CATEGORY HINT — pick query phrasings that will surface those "
+        "specific source types."
+    )
+    return "\n".join(parts)
 
 
 def generate_search_queries(
@@ -87,17 +167,7 @@ def generate_search_queries(
     category: str | None = None,
 ) -> list[str]:
     """Use an LLM to produce a small set of diverse search queries for the event."""
-    parts = [f"Event title: {title}"]
-    if category:
-        parts.append(f"Category: {category}")
-    if description:
-        parts.append(f"Description: {description}")
-    parts.append(f"Today: {date.today().isoformat()}")
-    parts.append(
-        f"\nReturn {MAX_SEARCH_QUERIES} distinct, well-formed search queries "
-        "that, together, would ground a forecast on this event."
-    )
-    user_prompt = "\n".join(parts)
+    user_prompt = _build_query_user_prompt(title, description, category)
 
     try:
         data = call_llm_json(
