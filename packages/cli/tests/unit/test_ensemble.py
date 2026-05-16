@@ -383,3 +383,146 @@ def test_predict_delay_handles_garbage_env_value(monkeypatch) -> None:
 
     ensemble_agent.predict({"title": "x"})
     assert sleeps == [5.0]
+
+
+# ---------------------------------------------------------------------------
+# resolved_outcome shortcut + outcomes plumbing
+# ---------------------------------------------------------------------------
+
+
+def test_predict_shortcuts_on_resolved_yes(monkeypatch) -> None:
+    """A resolved event matching outcomes[0] returns p_yes=0.99 with no LLM calls."""
+    from ai_prophet.forecast import ensemble_agent
+
+    def _explode(*_args, **_kwargs):
+        raise AssertionError("resolved events must not hit the research/strategy path")
+
+    monkeypatch.setattr(
+        "ai_prophet.forecast.ensemble_agent.research_event", _explode
+    )
+    monkeypatch.setattr(
+        "ai_prophet.forecast.ensemble_agent.forecast_event", _explode
+    )
+
+    result = ensemble_agent.predict(
+        {
+            "market_ticker": "TEST",
+            "title": "Did A win?",
+            "outcomes": ["A", "B"],
+            "resolved_outcome": "A",
+        }
+    )
+    assert result["p_yes"] == 0.99
+    assert "resolved" in result["rationale"].lower()
+
+
+def test_predict_shortcuts_on_resolved_no(monkeypatch) -> None:
+    """A resolved event matching outcomes[1] returns p_yes=0.01."""
+    from ai_prophet.forecast import ensemble_agent
+
+    def _explode(*_args, **_kwargs):
+        raise AssertionError("resolved events must not hit the research/strategy path")
+
+    monkeypatch.setattr(
+        "ai_prophet.forecast.ensemble_agent.research_event", _explode
+    )
+    monkeypatch.setattr(
+        "ai_prophet.forecast.ensemble_agent.forecast_event", _explode
+    )
+
+    result = ensemble_agent.predict(
+        {
+            "market_ticker": "TEST",
+            "title": "Did A win?",
+            "outcomes": ["A", "B"],
+            "resolved_outcome": "B",
+        }
+    )
+    assert result["p_yes"] == 0.01
+
+
+def test_predict_shortcut_accepts_dict_shaped_resolved_outcome(monkeypatch) -> None:
+    """Datasets ship ``resolved_outcome`` as ``{"value": [name]}`` — handle that."""
+    from ai_prophet.forecast import ensemble_agent
+
+    monkeypatch.setattr(
+        "ai_prophet.forecast.ensemble_agent.research_event",
+        lambda **_kw: (_ for _ in ()).throw(AssertionError("should not run")),
+    )
+
+    result = ensemble_agent.predict(
+        {
+            "market_ticker": "TEST",
+            "title": "Match",
+            "outcomes": ["Alice", "Bob"],
+            "resolved_outcome": {"value": ["Bob"], "source": "X"},
+        }
+    )
+    assert result["p_yes"] == 0.01
+
+
+def test_predict_no_shortcut_when_resolved_outcome_unknown_value(monkeypatch) -> None:
+    """If resolved_outcome doesn't match either side, fall through to full pipeline."""
+    from ai_prophet.forecast import ensemble_agent
+
+    monkeypatch.setenv("PREDICTION_DELAY", "0")
+    for key in ("GROQ_API_KEY", "OPENROUTER_API_KEY", "ANTHROPIC_API_KEY"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr(
+        "ai_prophet.forecast.ensemble_agent.research_event",
+        lambda **_kw: "",
+    )
+
+    result = ensemble_agent.predict(
+        {
+            "market_ticker": "TEST",
+            "title": "Match",
+            "outcomes": ["Alice", "Bob"],
+            "resolved_outcome": "Carol",  # not in outcomes
+        }
+    )
+    # Full pipeline ran with no API keys -> graceful fallback to 0.5
+    assert result["p_yes"] == 0.5
+
+
+def test_strategy_prompt_includes_outcomes_line() -> None:
+    """All three strategies render the OUTCOMES line when outcomes are present."""
+    from ai_prophet.forecast.strategies.base_rate import (
+        _build_user_prompt as base_rate_prompt,
+    )
+    from ai_prophet.forecast.strategies.contrarian import (
+        _build_user_prompt as contrarian_prompt,
+    )
+    from ai_prophet.forecast.strategies.evidence import (
+        _build_user_prompt as evidence_prompt,
+    )
+
+    kwargs = {
+        "title": "Match",
+        "description": None,
+        "category": "Sports",
+        "rules": None,
+        "close_time": None,
+        "research": "",
+        "outcomes": ["Lakers", "Thunder"],
+    }
+    for fn in (evidence_prompt, base_rate_prompt, contrarian_prompt):
+        rendered = fn(**kwargs)
+        assert "OUTCOMES: YES = Lakers, NO = Thunder" in rendered
+
+
+def test_strategy_prompt_omits_outcomes_line_when_missing() -> None:
+    """When outcomes is None or too short, no OUTCOMES line is added."""
+    from ai_prophet.forecast.strategies.evidence import _build_user_prompt
+
+    for outcomes in (None, [], ["only-one"]):
+        rendered = _build_user_prompt(
+            title="t",
+            description=None,
+            category=None,
+            rules=None,
+            close_time=None,
+            research="",
+            outcomes=outcomes,
+        )
+        assert "OUTCOMES:" not in rendered

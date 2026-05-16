@@ -56,6 +56,7 @@ def _build_user_prompt(
     rules: str | None,
     close_time: str | None,
     research: str,
+    outcomes: list[str] | None = None,
 ) -> str:
     lines = [
         f"Today: {date.today().isoformat()}",
@@ -63,6 +64,8 @@ def _build_user_prompt(
     ]
     if category:
         lines.append(f"Category: {category}")
+    if outcomes and len(outcomes) >= 2:
+        lines.append(f"OUTCOMES: YES = {outcomes[0]}, NO = {outcomes[1]}")
     if description:
         lines.append(f"Description: {description}")
     if rules:
@@ -95,6 +98,7 @@ class EvidenceWeightedStrategy:
         rules: str | None = None,
         close_time: str | None = None,
         research: str = "",
+        outcomes: list[str] | None = None,
     ) -> Estimate:
         user = _build_user_prompt(
             title=title,
@@ -103,6 +107,7 @@ class EvidenceWeightedStrategy:
             rules=rules,
             close_time=close_time,
             research=research,
+            outcomes=outcomes,
         )
         try:
             data = call_llm_json(

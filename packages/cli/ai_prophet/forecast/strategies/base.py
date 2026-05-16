@@ -37,6 +37,7 @@ class Strategy(Protocol):
         rules: str | None,
         close_time: str | None,
         research: str,
+        outcomes: list[str] | None = None,
     ) -> Estimate: ...
 
 

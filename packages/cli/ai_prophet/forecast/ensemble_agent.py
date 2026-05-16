@@ -50,6 +50,8 @@ class EventRequest(BaseModel):
     category: str | None = None
     rules: str | None = None
     close_time: str | None = None
+    outcomes: list[str] | None = None
+    resolved_outcome: Any | None = None
 
 
 class PredictionResponse(BaseModel):
@@ -79,6 +81,8 @@ def _coerce_event(event: dict[str, Any]) -> EventRequest:
     close = event.get("close_time")
     if close is not None and not isinstance(close, str):
         close = str(close)
+    raw_outcomes = event.get("outcomes")
+    outcomes = list(raw_outcomes) if isinstance(raw_outcomes, list) else None
     return EventRequest(
         event_ticker=event.get("event_ticker"),
         market_ticker=event.get("market_ticker"),
@@ -88,7 +92,33 @@ def _coerce_event(event: dict[str, Any]) -> EventRequest:
         category=event.get("category"),
         rules=event.get("rules"),
         close_time=close,
+        outcomes=outcomes,
+        resolved_outcome=event.get("resolved_outcome"),
     )
+
+
+def _resolved_outcome_value(raw: Any) -> str | None:
+    """Normalize ``resolved_outcome`` to a single outcome string, or None.
+
+    Accepts the two shapes seen in the wild:
+      * a bare string (live-event format)
+      * a dict with a ``"value"`` key that is either a string or a list
+        of strings (the dataset-registry shape).
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        stripped = raw.strip()
+        return stripped or None
+    if isinstance(raw, dict):
+        value = raw.get("value")
+        if isinstance(value, str):
+            return value.strip() or None
+        if isinstance(value, list) and value:
+            first = value[0]
+            if isinstance(first, str):
+                return first.strip() or None
+    return None
 
 
 def _run_strategy(strategy: Any, event: EventRequest, research: str) -> Estimate:
@@ -100,6 +130,7 @@ def _run_strategy(strategy: Any, event: EventRequest, research: str) -> Estimate
             rules=event.rules,
             close_time=event.close_time,
             research=research,
+            outcomes=event.outcomes,
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning("strategy %s crashed: %s", getattr(strategy, "name", "?"), exc)
@@ -186,6 +217,45 @@ def _prediction_delay_seconds() -> float:
     return max(0.0, value)
 
 
+def _resolved_shortcut(event: dict[str, Any]) -> dict | None:
+    """Return a finished prediction if the event is already resolved.
+
+    When ``resolved_outcome`` is populated and ``outcomes[0]`` / ``outcomes[1]``
+    name the YES and NO sides, the answer is known — there is no reason to
+    burn LLM calls. Returns ``None`` if the event isn't conclusively resolved
+    against the known outcomes.
+
+    p_yes is clamped to the ``Prediction`` schema's ``[0.01, 0.99]`` bounds
+    rather than 1.0 / 0.0 so the CLI's downstream validation accepts it.
+    """
+    resolved = _resolved_outcome_value(event.get("resolved_outcome"))
+    if resolved is None:
+        return None
+    raw_outcomes = event.get("outcomes")
+    if not isinstance(raw_outcomes, list) or len(raw_outcomes) < 2:
+        return None
+
+    yes_side = str(raw_outcomes[0]).strip()
+    no_side = str(raw_outcomes[1]).strip()
+    if resolved == yes_side:
+        return {
+            "p_yes": 0.99,
+            "rationale": (
+                f"Event already resolved: {resolved!r} matches outcomes[0]. "
+                "Skipped research and strategies."
+            ),
+        }
+    if resolved == no_side:
+        return {
+            "p_yes": 0.01,
+            "rationale": (
+                f"Event already resolved: {resolved!r} matches outcomes[1]. "
+                "Skipped research and strategies."
+            ),
+        }
+    return None
+
+
 def predict(event: dict) -> dict:
     """CLI-facing prediction function.
 
@@ -194,10 +264,23 @@ def predict(event: dict) -> dict:
     ``prophet forecast predict``. Failures are swallowed and yield a safe
     fallback of ``p_yes=0.5``.
 
-    After each call this function sleeps for ``PREDICTION_DELAY`` seconds
-    (default 5, overridable via the ``PREDICTION_DELAY`` env var) so that
-    callers iterating over many events stay within provider rate limits.
+    Events whose ``resolved_outcome`` already matches one of the two
+    ``outcomes`` entries are short-circuited: we return the known answer
+    directly and skip research, strategies, and pacing.
+
+    Otherwise, after each call this function sleeps for ``PREDICTION_DELAY``
+    seconds (default 5, overridable via the ``PREDICTION_DELAY`` env var) so
+    that callers iterating over many events stay within provider rate limits.
     """
+    shortcut = _resolved_shortcut(event)
+    if shortcut is not None:
+        logger.info(
+            "predict.shortcut ticker=%s p_yes=%.2f",
+            event.get("market_ticker"),
+            shortcut["p_yes"],
+        )
+        return shortcut
+
     try:
         event_req = _coerce_event(event)
         final = forecast_event(event_req)
