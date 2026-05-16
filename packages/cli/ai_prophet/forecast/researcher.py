@@ -44,9 +44,16 @@ DDG_USER_AGENTS = (
 )
 DEFAULT_USER_AGENT = DDG_USER_AGENTS[0]
 
-SEARCH_TIMEOUT = 12.0
-FETCH_TIMEOUT = 10.0
+SEARCH_TIMEOUT = 8.0
+FETCH_TIMEOUT = 5.0
 RESEARCH_BRIEF_MAX_CHARS = 8000
+
+# Throughput knobs. Empirically the 4th and 5th query rarely add new evidence —
+# the first three (current state, recent news, contrarian angle) dominate. And
+# the 3rd result per query is usually a forum repost. Keeping the brief lean
+# also keeps the strategies' input tokens down.
+MAX_SEARCH_QUERIES = 3
+MAX_SEARCH_RESULTS = 2
 
 # Per-event burst control. DDG starts throttling after ~5-10 rapid queries from
 # the same IP. A jittered inter-query pause is much cheaper than burning every
@@ -62,14 +69,14 @@ DDG_THROTTLE_STATUSES = {202, 403, 429}
 
 _QUERY_SYSTEM_PROMPT = """You generate web search queries for a forecasting analyst.
 
-Given a binary prediction-market question, output 5 diverse search queries that
+Given a binary prediction-market question, output 3 diverse search queries that
 together would give a well-informed forecaster a strong view on the likely
-outcome. Each query should target a distinct angle: current status, recent
-news, historical base rate, expert commentary, and contradictory or risk-
+outcome. Each query should target a distinct angle: current status / recent
+news, historical base rate or expert commentary, and contradictory or risk-
 oriented information.
 
 Respond with ONLY a JSON object of the form:
-{"queries": ["query 1", "query 2", "query 3", "query 4", "query 5"]}
+{"queries": ["query 1", "query 2", "query 3"]}
 
 No prose, no markdown fences, no commentary."""
 
@@ -79,7 +86,7 @@ def generate_search_queries(
     description: str | None = None,
     category: str | None = None,
 ) -> list[str]:
-    """Use an LLM to produce 5 diverse search queries for the event."""
+    """Use an LLM to produce a small set of diverse search queries for the event."""
     parts = [f"Event title: {title}"]
     if category:
         parts.append(f"Category: {category}")
@@ -87,8 +94,8 @@ def generate_search_queries(
         parts.append(f"Description: {description}")
     parts.append(f"Today: {date.today().isoformat()}")
     parts.append(
-        "\nReturn 5 distinct, well-formed search queries that, together, would "
-        "ground a forecast on this event."
+        f"\nReturn {MAX_SEARCH_QUERIES} distinct, well-formed search queries "
+        "that, together, would ground a forecast on this event."
     )
     user_prompt = "\n".join(parts)
 
@@ -112,7 +119,7 @@ def generate_search_queries(
     for q in queries:
         if isinstance(q, str) and q.strip():
             cleaned.append(q.strip())
-        if len(cleaned) == 5:
+        if len(cleaned) == MAX_SEARCH_QUERIES:
             break
 
     if not cleaned:
@@ -123,13 +130,14 @@ def generate_search_queries(
 def _fallback_queries(title: str, category: str | None) -> list[str]:
     base = title.strip()
     suffix = f" {category}" if category else ""
-    return [
+    candidates = [
         base,
         f"{base} latest news",
         f"{base} forecast {date.today().year}",
         f"{base} odds prediction",
         f"{base}{suffix} analysis",
     ]
+    return candidates[:MAX_SEARCH_QUERIES]
 
 
 # ---------------------------------------------------------------------------
@@ -182,7 +190,9 @@ def _ddg_request(query: str, *, user_agent: str, method: str) -> httpx.Response 
         return None
 
 
-def search_duckduckgo(query: str, max_results: int = 3) -> list[dict[str, str]]:
+def search_duckduckgo(
+    query: str, max_results: int = MAX_SEARCH_RESULTS
+) -> list[dict[str, str]]:
     """Search DDG's HTML endpoint and return up to ``max_results`` results.
 
     Each result is a dict with ``url``, ``title``, ``snippet``. On any failure
@@ -293,7 +303,7 @@ def research_event(
     category: str | None = None,
     rules: str | None = None,
     *,
-    max_results_per_query: int = 3,
+    max_results_per_query: int = MAX_SEARCH_RESULTS,
     max_chars: int = RESEARCH_BRIEF_MAX_CHARS,
 ) -> str:
     """Run the full research pipeline and return a compiled brief.
