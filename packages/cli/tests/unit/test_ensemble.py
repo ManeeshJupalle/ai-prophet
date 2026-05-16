@@ -239,6 +239,8 @@ def test_predict_returns_valid_payload_with_no_keys(monkeypatch) -> None:
         monkeypatch.delenv(key, raising=False)
     # Pacing sleep would slow the suite — disable it for this test.
     monkeypatch.setenv("PREDICTION_DELAY", "0")
+    # Don't touch the project-root cache file.
+    monkeypatch.setenv("ENABLE_CACHE", "false")
     # Prevent the researcher from making real HTTP calls.
     monkeypatch.setattr(
         "ai_prophet.forecast.ensemble_agent.research_event",
@@ -333,6 +335,7 @@ def test_predict_sleeps_for_prediction_delay(monkeypatch) -> None:
     from ai_prophet.forecast import ensemble_agent
 
     monkeypatch.setenv("PREDICTION_DELAY", "3")
+    monkeypatch.setenv("ENABLE_CACHE", "false")
     monkeypatch.setattr(
         "ai_prophet.forecast.ensemble_agent.research_event",
         lambda **_kw: "",
@@ -352,6 +355,7 @@ def test_predict_delay_disabled_when_zero(monkeypatch) -> None:
     from ai_prophet.forecast import ensemble_agent
 
     monkeypatch.setenv("PREDICTION_DELAY", "0")
+    monkeypatch.setenv("ENABLE_CACHE", "false")
     monkeypatch.setattr(
         "ai_prophet.forecast.ensemble_agent.research_event",
         lambda **_kw: "",
@@ -371,6 +375,7 @@ def test_predict_delay_handles_garbage_env_value(monkeypatch) -> None:
     from ai_prophet.forecast import ensemble_agent
 
     monkeypatch.setenv("PREDICTION_DELAY", "not-a-number")
+    monkeypatch.setenv("ENABLE_CACHE", "false")
     monkeypatch.setattr(
         "ai_prophet.forecast.ensemble_agent.research_event",
         lambda **_kw: "",
@@ -466,6 +471,7 @@ def test_predict_no_shortcut_when_resolved_outcome_unknown_value(monkeypatch) ->
     from ai_prophet.forecast import ensemble_agent
 
     monkeypatch.setenv("PREDICTION_DELAY", "0")
+    monkeypatch.setenv("ENABLE_CACHE", "false")
     for key in ("GROQ_API_KEY", "OPENROUTER_API_KEY", "ANTHROPIC_API_KEY"):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setattr(
@@ -732,3 +738,237 @@ def test_deliberate_returns_none_on_bad_payload(monkeypatch) -> None:
         Estimate(p_yes=0.5, rationale="r", strategy="x", confidence=0.5),
     ]
     assert ensemble_agent._deliberate(event, estimates) is None
+
+
+# ---------------------------------------------------------------------------
+# Prediction cache integration
+# ---------------------------------------------------------------------------
+
+
+def _isolate_cache(monkeypatch, tmp_path) -> str:
+    """Point the cache at a tmp path so tests don't share state."""
+    cache_file = str(tmp_path / "cache.json")
+    monkeypatch.setenv("PREDICTION_CACHE_PATH", cache_file)
+    return cache_file
+
+
+def test_predict_cache_hit_skips_pipeline(monkeypatch, tmp_path) -> None:
+    """A fresh cache entry short-circuits the entire pipeline."""
+    from ai_prophet.forecast import cache as cache_mod
+    from ai_prophet.forecast import ensemble_agent
+
+    _isolate_cache(monkeypatch, tmp_path)
+    monkeypatch.setenv("ENABLE_CACHE", "true")
+    monkeypatch.setenv("PREDICTION_DELAY", "0")
+
+    cache_mod.cache_prediction("CACHED-TICKER", 0.61, "from cache")
+
+    def explode(*_a, **_kw):
+        raise AssertionError("pipeline must not run on cache hit")
+
+    monkeypatch.setattr(ensemble_agent, "forecast_event", explode)
+    monkeypatch.setattr(ensemble_agent, "research_event", explode)
+
+    result = ensemble_agent.predict(
+        {"market_ticker": "CACHED-TICKER", "title": "anything"}
+    )
+    assert result["p_yes"] == pytest.approx(0.61)
+    assert result["rationale"] == "from cache"
+
+
+def test_predict_cache_miss_runs_pipeline_and_caches(monkeypatch, tmp_path) -> None:
+    """A cache miss runs the pipeline and writes the result back to disk."""
+    from ai_prophet.forecast import cache as cache_mod
+    from ai_prophet.forecast import ensemble_agent
+    from ai_prophet.forecast.ensemble import FinalPrediction
+
+    _isolate_cache(monkeypatch, tmp_path)
+    monkeypatch.setenv("ENABLE_CACHE", "true")
+    monkeypatch.setenv("PREDICTION_DELAY", "0")
+
+    fake_estimate = Estimate(
+        p_yes=0.73, rationale="r", strategy="s", confidence=0.7
+    )
+    fake_final = FinalPrediction(
+        p_yes=0.73,
+        rationale="ensembled",
+        raw_p_yes=0.73,
+        agreement=1.0,
+        shrinkage=0.05,
+        estimates=[fake_estimate],
+    )
+    monkeypatch.setattr(
+        ensemble_agent, "forecast_event", lambda _event: fake_final
+    )
+
+    assert cache_mod.get_cached_prediction("FRESH-TICKER") is None
+    result = ensemble_agent.predict(
+        {"market_ticker": "FRESH-TICKER", "title": "t"}
+    )
+    assert result["p_yes"] == pytest.approx(0.73)
+    # Result was written back to the cache.
+    cached = cache_mod.get_cached_prediction("FRESH-TICKER")
+    assert cached is not None
+    assert cached["p_yes"] == pytest.approx(0.73)
+    assert cached["rationale"] == "ensembled"
+
+
+def test_predict_expired_entry_is_refreshed(monkeypatch, tmp_path) -> None:
+    """A cache entry past its expires_at triggers a fresh pipeline run."""
+    import json
+    from datetime import UTC, datetime, timedelta
+    from pathlib import Path
+
+    from ai_prophet.forecast import ensemble_agent
+    from ai_prophet.forecast.ensemble import FinalPrediction
+
+    cache_file = _isolate_cache(monkeypatch, tmp_path)
+    monkeypatch.setenv("ENABLE_CACHE", "true")
+    monkeypatch.setenv("PREDICTION_DELAY", "0")
+
+    # Pre-populate with an entry that expired an hour ago.
+    past = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
+    Path(cache_file).write_text(
+        json.dumps(
+            {
+                "STALE-TICKER": {
+                    "p_yes": 0.99,
+                    "rationale": "ancient history",
+                    "timestamp": past,
+                    "expires_at": past,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    fresh_final = FinalPrediction(
+        p_yes=0.34,
+        rationale="freshly computed",
+        raw_p_yes=0.34,
+        agreement=1.0,
+        shrinkage=0.05,
+        estimates=[Estimate(p_yes=0.34, rationale="r", strategy="s", confidence=0.7)],
+    )
+    monkeypatch.setattr(
+        ensemble_agent, "forecast_event", lambda _event: fresh_final
+    )
+
+    result = ensemble_agent.predict(
+        {"market_ticker": "STALE-TICKER", "title": "t"}
+    )
+    # The expired entry was ignored; the fresh prediction returned.
+    assert result["p_yes"] == pytest.approx(0.34)
+    assert result["rationale"] == "freshly computed"
+
+
+def test_predict_does_not_cache_when_pipeline_falls_back_to_half(
+    monkeypatch, tmp_path
+) -> None:
+    """When every strategy fails, the 0.5 fallback must NOT be cached."""
+    from ai_prophet.forecast import cache as cache_mod
+    from ai_prophet.forecast import ensemble_agent
+    from ai_prophet.forecast.ensemble import FinalPrediction
+
+    _isolate_cache(monkeypatch, tmp_path)
+    monkeypatch.setenv("ENABLE_CACHE", "true")
+    monkeypatch.setenv("PREDICTION_DELAY", "0")
+
+    # An all-failed ensemble has empty estimates (post-filter).
+    failed_final = FinalPrediction(
+        p_yes=0.5,
+        rationale="all strategies failed",
+        raw_p_yes=0.5,
+        agreement=0.0,
+        shrinkage=0.15,
+        estimates=[],
+    )
+    monkeypatch.setattr(
+        ensemble_agent, "forecast_event", lambda _event: failed_final
+    )
+
+    result = ensemble_agent.predict(
+        {"market_ticker": "DOOMED", "title": "t"}
+    )
+    assert result["p_yes"] == 0.5
+    assert cache_mod.get_cached_prediction("DOOMED") is None
+
+
+def test_predict_with_cache_disabled_skips_both_read_and_write(
+    monkeypatch, tmp_path
+) -> None:
+    """ENABLE_CACHE=false bypasses the cache for both reads and writes."""
+    from ai_prophet.forecast import cache as cache_mod
+    from ai_prophet.forecast import ensemble_agent
+    from ai_prophet.forecast.ensemble import FinalPrediction
+
+    _isolate_cache(monkeypatch, tmp_path)
+    monkeypatch.setenv("ENABLE_CACHE", "false")
+    monkeypatch.setenv("PREDICTION_DELAY", "0")
+
+    # Pre-populate the cache with a value we should NOT see.
+    cache_mod.cache_prediction("X", 0.99, "should be ignored")
+
+    fresh_final = FinalPrediction(
+        p_yes=0.42,
+        rationale="pipeline ran",
+        raw_p_yes=0.42,
+        agreement=1.0,
+        shrinkage=0.05,
+        estimates=[Estimate(p_yes=0.42, rationale="r", strategy="s", confidence=0.7)],
+    )
+    monkeypatch.setattr(
+        ensemble_agent, "forecast_event", lambda _event: fresh_final
+    )
+
+    result = ensemble_agent.predict({"market_ticker": "X", "title": "t"})
+    # Pipeline ran (didn't return the cached 0.99).
+    assert result["p_yes"] == pytest.approx(0.42)
+    # Original cache entry is unchanged — predict() didn't overwrite it
+    # because caching is off.
+    cached = cache_mod.get_cached_prediction("X")
+    assert cached is not None
+    assert cached["p_yes"] == pytest.approx(0.99)
+
+
+def test_predict_without_market_ticker_skips_cache(monkeypatch, tmp_path) -> None:
+    """Events with no market_ticker can still be predicted; cache is a no-op."""
+    from ai_prophet.forecast import ensemble_agent
+    from ai_prophet.forecast.ensemble import FinalPrediction
+
+    _isolate_cache(monkeypatch, tmp_path)
+    monkeypatch.setenv("ENABLE_CACHE", "true")
+    monkeypatch.setenv("PREDICTION_DELAY", "0")
+
+    fresh_final = FinalPrediction(
+        p_yes=0.55,
+        rationale="r",
+        raw_p_yes=0.55,
+        agreement=1.0,
+        shrinkage=0.05,
+        estimates=[Estimate(p_yes=0.55, rationale="r", strategy="s", confidence=0.7)],
+    )
+    monkeypatch.setattr(
+        ensemble_agent, "forecast_event", lambda _event: fresh_final
+    )
+
+    result = ensemble_agent.predict({"title": "no ticker"})
+    assert result["p_yes"] == pytest.approx(0.55)
+
+
+def test_predict_cache_hit_skips_pacing_sleep(monkeypatch, tmp_path) -> None:
+    """A cache hit does no work, so it must not invoke PREDICTION_DELAY."""
+    from ai_prophet.forecast import cache as cache_mod
+    from ai_prophet.forecast import ensemble_agent
+
+    _isolate_cache(monkeypatch, tmp_path)
+    monkeypatch.setenv("ENABLE_CACHE", "true")
+    monkeypatch.setenv("PREDICTION_DELAY", "5")
+
+    cache_mod.cache_prediction("FAST", 0.65, "r")
+
+    sleeps: list[float] = []
+    monkeypatch.setattr(ensemble_agent.time, "sleep", lambda s: sleeps.append(s))
+
+    ensemble_agent.predict({"market_ticker": "FAST", "title": "t"})
+    assert sleeps == []

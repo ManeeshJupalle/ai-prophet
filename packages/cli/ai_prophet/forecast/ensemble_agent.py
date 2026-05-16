@@ -24,6 +24,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
+from .cache import cache_enabled, cache_prediction, get_cached_prediction
 from .ensemble import FinalPrediction, ensemble_predict
 from .llm_utils import call_llm_json
 from .researcher import research_event
@@ -424,29 +425,60 @@ def predict(event: dict) -> dict:
     ``outcomes`` entries are short-circuited: we return the known answer
     directly and skip research, strategies, and pacing.
 
+    If caching is enabled (``ENABLE_CACHE=true``, the default) and a fresh
+    entry exists for the event's ``market_ticker``, the cached payload is
+    returned immediately — no research, no strategies, no pacing sleep.
+    Successful predictions are cached for ``CACHE_TTL_HOURS`` hours (default
+    6) so repeated polls from the evaluation harness reuse the same work.
+
     Otherwise, after each call this function sleeps for ``PREDICTION_DELAY``
     seconds (default 5, overridable via the ``PREDICTION_DELAY`` env var) so
     that callers iterating over many events stay within provider rate limits.
     """
+    ticker = event.get("market_ticker")
+
     shortcut = _resolved_shortcut(event)
     if shortcut is not None:
         logger.info(
             "predict.shortcut ticker=%s p_yes=%.2f",
-            event.get("market_ticker"),
+            ticker,
             shortcut["p_yes"],
         )
         return shortcut
 
+    if cache_enabled():
+        cached = get_cached_prediction(ticker)
+        if cached is not None:
+            logger.info(
+                "predict.cache_hit ticker=%s p_yes=%.3f expires_at=%s",
+                ticker,
+                cached["p_yes"],
+                cached.get("expires_at"),
+            )
+            # Cache hit means zero LLM work was done — skip pacing too.
+            return {
+                "p_yes": cached["p_yes"],
+                "rationale": cached["rationale"],
+            }
+
+    succeeded = False
     try:
         event_req = _coerce_event(event)
         final = forecast_event(event_req)
         result = {"p_yes": final.p_yes, "rationale": final.rationale}
+        # Only treat as success if at least one strategy survived the
+        # confidence floor — an all-failed ensemble returns 0.5, which we
+        # don't want to lock into the cache for 6 hours.
+        succeeded = bool(final.estimates)
     except Exception as exc:  # noqa: BLE001 — never crash the CLI
         logger.exception("predict() failed: %s", exc)
         result = {
             "p_yes": 0.5,
             "rationale": f"Ensemble agent failed: {exc}. Defaulting to 0.5.",
         }
+
+    if succeeded and cache_enabled():
+        cache_prediction(ticker, result["p_yes"], result["rationale"])
 
     delay = _prediction_delay_seconds()
     if delay > 0:
