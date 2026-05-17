@@ -460,8 +460,19 @@ def _run_strategy(
         return failed_estimate(getattr(strategy, "name", "unknown"), str(exc))
 
 
-def forecast_event(event: EventRequest) -> FinalPrediction:
-    """Run the full ensemble pipeline for one event and return its prediction."""
+def forecast_event(
+    event: EventRequest,
+    *,
+    research_override: str | None = None,
+) -> FinalPrediction:
+    """Run the full ensemble pipeline for one event and return its prediction.
+
+    When ``research_override`` is provided (non-empty), the web-research
+    phase is skipped and the override is used as the brief that feeds all
+    strategies. This lets the OpenAI-compatible endpoint reuse the source
+    bundle the evaluator already curated in the chat ``user`` message
+    instead of paying ~10 s to rebuild a worse one ourselves.
+    """
     overall_start = time.perf_counter()
 
     # Compute temporal context once and pass it everywhere downstream:
@@ -478,20 +489,28 @@ def forecast_event(event: EventRequest) -> FinalPrediction:
         factor,
     )
 
-    # Phase 1: research
+    # Phase 1: research (skipped if caller supplied a curated brief)
     research_start = time.perf_counter()
-    research = research_event(
-        title=event.title,
-        description=event.description,
-        category=event.category,
-        rules=event.rules,
-    )
-    logger.info(
-        "phase=research ticker=%s chars=%d elapsed=%.2fs",
-        event.market_ticker,
-        len(research),
-        time.perf_counter() - research_start,
-    )
+    if research_override:
+        research = research_override
+        logger.info(
+            "phase=research ticker=%s chars=%d source=override",
+            event.market_ticker,
+            len(research),
+        )
+    else:
+        research = research_event(
+            title=event.title,
+            description=event.description,
+            category=event.category,
+            rules=event.rules,
+        )
+        logger.info(
+            "phase=research ticker=%s chars=%d elapsed=%.2fs",
+            event.market_ticker,
+            len(research),
+            time.perf_counter() - research_start,
+        )
 
     # Phase 1.5: fast-resolve smart routing for Sports events that already
     # have a public result. Costs one cheap LLM call; if it returns a
@@ -1010,6 +1029,17 @@ _EVENT_TITLE_PATTERN = re.compile(
 )
 _MARKET_LINE_PATTERN = re.compile(r"^\s*[-*]\s+(.+?)\s*$", re.MULTILINE)
 
+# Anchor: find the bullet list that immediately follows the "possible
+# outcomes:" heading. Greedy across blank lines that still contain bullets,
+# stops at the first non-bullet, non-blank line. Keeping this scoped means
+# unrelated instruction bullets elsewhere in the system prompt ("- Do not
+# invent outcomes", "- Use the exact name", etc.) don't get parsed as
+# markets.
+_OUTCOMES_BLOCK_PATTERN = re.compile(
+    r"possible\s+outcomes\s*:?\s*\n((?:\s*[-*]\s+.+\n?)+)",
+    re.IGNORECASE,
+)
+
 _MULTI_MARKET_SYSTEM_PROMPT = """You are a calibrated forecasting analyst.
 You will be given a binary or multi-outcome prediction-market question, a
 list of POSSIBLE OUTCOMES (each is its own YES/NO question), and pre-curated
@@ -1072,19 +1102,29 @@ def _parse_chat_request(messages: list[dict]) -> dict:
     title_match = _EVENT_TITLE_PATTERN.search(system_text)
     title = title_match.group(1).strip() if title_match else ""
 
-    # Markets appear as a bulleted list right after "possible outcomes:" /
-    # "following possible outcomes:" / etc. We just collect every "- foo"
-    # line in the system content (the predictor prompt has no other lists).
+    # Markets appear as a bulleted list right after the "possible outcomes:"
+    # heading. Scope the regex to that block only — collecting every "- foo"
+    # line in the whole system prompt is fragile (other instruction bullets
+    # would be parsed as markets). Fall back to the broad scan only if no
+    # heading is found.
     markets: list[str] = []
-    for m in _MARKET_LINE_PATTERN.finditer(system_text):
-        candidate = m.group(1).strip()
-        # Skip lines that look like instruction bullets ("MUST", "Do NOT", etc.).
-        if (
-            candidate
-            and not candidate.lower().startswith(("must", "do ", "ensure", "use "))
-            and len(candidate) < 200
-        ):
-            markets.append(candidate)
+    block_match = _OUTCOMES_BLOCK_PATTERN.search(system_text)
+    if block_match:
+        block_text = block_match.group(1)
+        for m in _MARKET_LINE_PATTERN.finditer(block_text):
+            candidate = m.group(1).strip()
+            if candidate and len(candidate) < 200:
+                markets.append(candidate)
+    else:
+        for m in _MARKET_LINE_PATTERN.finditer(system_text):
+            candidate = m.group(1).strip()
+            # Skip instruction bullets when scanning the whole prompt.
+            if (
+                candidate
+                and not candidate.lower().startswith(("must", "do ", "ensure", "use "))
+                and len(candidate) < 200
+            ):
+                markets.append(candidate)
 
     return {
         "title": title,
@@ -1097,10 +1137,13 @@ def _parse_chat_request(messages: list[dict]) -> dict:
 def _normalize_probabilities(
     probabilities: dict[str, float], markets: list[str]
 ) -> dict[str, float]:
-    """Clamp each probability to ``[0.01, 0.99]`` and snap unknowns to ``1/N``.
+    """Clamp each probability to ``[P_MIN, P_MAX]``, fill missing with ``1/N``,
+    then sum-normalize so the values form a valid distribution.
 
-    The harness rejects missing/extra market names, so we always return a
-    probability for every market in ``markets`` and nothing else.
+    Clamping alone is not enough: an LLM that returns
+    ``{"A": 0.9, "B": 0.9, "C": 0.9}`` would emit a sum of 2.7 and the
+    scoring harness can reject or badly score that. The final divide-by-total
+    pass guarantees the output sums to 1.0 (within float epsilon).
     """
     out: dict[str, float] = {}
     n = max(1, len(markets))
@@ -1112,6 +1155,10 @@ def _normalize_probabilities(
         except (TypeError, ValueError):
             v = default
         out[m] = max(P_MIN, min(P_MAX, v))
+
+    total = sum(out.values())
+    if total > 0:
+        out = {m: v / total for m, v in out.items()}
     return out
 
 
@@ -1197,19 +1244,34 @@ def _handle_chat_completion(body: dict) -> dict:
             "probabilities": {},
         }
     elif len(markets) == 2:
-        # Binary event — run the full ensemble pipeline.
-        event_dict = {
-            "title": title or "(untitled event)",
-            "outcomes": markets,
-            "category": "Other",
-            "rules": None,
-            "close_time": None,
-            "description": research[:500] if research else None,
-        }
-        result = predict(event_dict, _skip_pacing=True)
-        p_yes = float(result["p_yes"])
+        # Binary event — run the full ensemble pipeline, feeding the
+        # evaluator's curated source bundle (the chat ``user`` message)
+        # directly into the strategies via ``research_override`` so we
+        # don't redo a worse web-research pass and pay ~10s for nothing.
+        event_req = EventRequest(
+            event_ticker="chat-event",
+            market_ticker="chat-event",
+            title=title or "(untitled event)",
+            category="Other",
+            outcomes=markets,
+            close_time=None,
+            description=None,
+            rules=None,
+            resolved_outcome=None,
+        )
+        try:
+            final = forecast_event(
+                event_req,
+                research_override=research if research else None,
+            )
+            p_yes = float(final.p_yes)
+            rationale = final.rationale
+        except Exception as exc:  # noqa: BLE001 — never break the harness
+            logger.warning("chat completions binary path failed: %s", exc)
+            p_yes = 0.5
+            rationale = f"Ensemble failed: {exc}; defaulting to 0.5."
         content = {
-            "rationale": result["rationale"][:1500],
+            "rationale": rationale[:1500],
             "probabilities": _normalize_probabilities(
                 {markets[0]: p_yes, markets[1]: 1.0 - p_yes}, markets
             ),

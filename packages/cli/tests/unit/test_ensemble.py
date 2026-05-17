@@ -1513,7 +1513,9 @@ def _stub_chat_pipeline(monkeypatch, tmp_path, p_yes: float = 0.55) -> None:
         shrinkage=0.05,
         estimates=[Estimate(p_yes=p_yes, rationale="r", strategy="s", confidence=0.7)],
     )
-    monkeypatch.setattr(ensemble_agent, "forecast_event", lambda _e: fake_final)
+    monkeypatch.setattr(
+        ensemble_agent, "forecast_event", lambda _e, **_kw: fake_final
+    )
 
 
 def test_parse_chat_request_extracts_title_and_markets() -> None:
@@ -1537,6 +1539,108 @@ def test_parse_chat_request_handles_empty_messages() -> None:
     parsed = _parse_chat_request([])
     assert parsed["title"] == ""
     assert parsed["markets"] == []
+
+
+def test_parse_chat_request_ignores_non_outcomes_bullets() -> None:
+    """Instruction bullets outside the 'possible outcomes:' block must not
+    leak into the markets list — only bullets directly under the outcomes
+    heading are real markets.
+    """
+    from ai_prophet.forecast.ensemble_agent import _parse_chat_request
+
+    prompt = """Event: "Foo vs Bar"
+You will be predicting the probability of ONLY the following possible outcomes:
+- Foo
+- Bar
+
+NOTES:
+- Consider recency
+- Weigh all sources
+- Format probabilities as floats
+- Always return JSON
+"""
+    parsed = _parse_chat_request(
+        [{"role": "system", "content": prompt}, {"role": "user", "content": "data"}]
+    )
+    assert parsed["markets"] == ["Foo", "Bar"]
+
+
+def test_normalize_probabilities_sum_normalizes() -> None:
+    """A pathological LLM output like {A: .9, B: .9, C: .9} (sum 2.7)
+    must come out summing to 1.0 after _normalize_probabilities — the
+    forecasting harness penalises distributions that don't sum to 1.
+    """
+    from ai_prophet.forecast.ensemble_agent import _normalize_probabilities
+
+    out = _normalize_probabilities(
+        {"A": 0.9, "B": 0.9, "C": 0.9}, ["A", "B", "C"]
+    )
+    total = sum(out.values())
+    assert total == pytest.approx(1.0, abs=1e-6)
+    # Each value should be roughly equal (uniform after normalization).
+    for v in out.values():
+        assert v == pytest.approx(1.0 / 3.0, abs=1e-6)
+
+
+def test_normalize_probabilities_fills_missing_then_normalizes() -> None:
+    """Missing markets get the 1/N default before sum normalization."""
+    from ai_prophet.forecast.ensemble_agent import _normalize_probabilities
+
+    out = _normalize_probabilities({"A": 0.5}, ["A", "B", "C"])
+    assert set(out.keys()) == {"A", "B", "C"}
+    assert sum(out.values()) == pytest.approx(1.0, abs=1e-6)
+
+
+def test_chat_completions_binary_uses_research_override(monkeypatch, tmp_path) -> None:
+    """Binary chat completions must feed the user-provided source bundle
+    to the ensemble (research_override) rather than running fresh web
+    research via research_event."""
+    from ai_prophet.forecast import ensemble_agent
+    from ai_prophet.forecast.ensemble import FinalPrediction
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setenv("PREDICTION_CACHE_PATH", str(tmp_path / "cache.json"))
+    monkeypatch.setenv("ENABLE_CACHE", "false")
+
+    research_event_called = {"count": 0}
+
+    def fake_research_event(**_kw):
+        research_event_called["count"] += 1
+        return "(should not be called)"
+
+    captured_override = {"value": None}
+
+    def fake_forecast_event(event, *, research_override=None):
+        captured_override["value"] = research_override
+        return FinalPrediction(
+            p_yes=0.6,
+            rationale="from override",
+            raw_p_yes=0.6,
+            agreement=1.0,
+            shrinkage=0.0,
+            estimates=[Estimate(p_yes=0.6, rationale="r", strategy="s", confidence=0.7)],
+        )
+
+    monkeypatch.setattr(ensemble_agent, "research_event", fake_research_event)
+    monkeypatch.setattr(ensemble_agent, "forecast_event", fake_forecast_event)
+
+    client = TestClient(ensemble_agent.app)
+    resp = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "ensemble-agent",
+            "messages": [
+                {"role": "system", "content": _REFERENCE_SYSTEM_PROMPT},
+                {"role": "user", "content": "EVALUATOR-PROVIDED-RESEARCH"},
+            ],
+        },
+    )
+    assert resp.status_code == 200
+    # The override must carry the evaluator's user content (or at least
+    # something derived from it), and research_event must NOT have run.
+    assert captured_override["value"] is not None
+    assert "EVALUATOR-PROVIDED-RESEARCH" in captured_override["value"]
+    assert research_event_called["count"] == 0
 
 
 def test_chat_completions_v1_binary_event(monkeypatch, tmp_path) -> None:
@@ -1682,15 +1786,29 @@ def test_chat_completions_unparseable_prompt_returns_safe_payload(
 
 
 def test_normalize_probabilities_clamps_and_fills() -> None:
-    """Missing markets get 1/N; values are clamped to [0.01, 0.99]."""
+    """Values are clamped to [0.01, 0.99], missing fields default to 1/N,
+    then everything is sum-normalized to form a valid distribution.
+
+    Pre-normalization values: A=0.99 (clamped from 1.5), B=0.01 (clamped
+    from -0.3), C=1/3 (default for missing). Total before normalize:
+    0.99 + 0.01 + 0.333… ≈ 1.333. After normalize each is scaled by
+    ~0.75 so the distribution sums to 1.
+    """
     from ai_prophet.forecast.ensemble_agent import _normalize_probabilities
 
     markets = ["A", "B", "C"]
     out = _normalize_probabilities({"A": 1.5, "B": -0.3}, markets)
-    assert out["A"] == 0.99  # clamped
-    assert out["B"] == 0.01  # clamped
-    assert out["C"] == pytest.approx(1.0 / 3)  # default for missing
-    assert set(out.keys()) == {"A", "B", "C"}  # no extras
+    # Order matters: A should still be the largest, B the smallest.
+    assert out["A"] > out["C"] > out["B"]
+    # Every market present, no extras.
+    assert set(out.keys()) == {"A", "B", "C"}
+    # Sum-normalized distribution.
+    assert sum(out.values()) == pytest.approx(1.0, abs=1e-6)
+    # Sanity: clamped extremes still skew the distribution heavily —
+    # A (clamp-high) carries most of the mass, B (clamp-low) carries
+    # almost none.
+    assert out["A"] > 0.5
+    assert out["B"] < 0.05
 
 
 def test_chat_completions_response_has_openai_shape(monkeypatch, tmp_path) -> None:
