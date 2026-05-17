@@ -39,3 +39,4 @@ prediction_cache.json
 
 # OS/editor
 .DS_Store
+*.json

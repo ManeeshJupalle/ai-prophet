@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class Event(BaseModel):
@@ -23,12 +23,26 @@ class Event(BaseModel):
     resolved_outcome: dict[str, Any] | None = None
 
 
+class MarketProbability(BaseModel):
+    """A probability assigned to one outcome in a forecast event."""
+
+    market: str
+    probability: float = Field(ge=0.0, le=1.0)
+
+
 class Prediction(BaseModel):
-    """A single forecast for a market."""
+    """A single forecast for a market or event."""
 
     market_ticker: str
-    p_yes: float = Field(ge=0.01, le=0.99)
+    p_yes: float | None = Field(default=None, ge=0.01, le=0.99)
+    probabilities: list[MarketProbability] | None = None
     rationale: str | None = None
+
+    @model_validator(mode="after")
+    def _require_forecast(self) -> Prediction:
+        if self.p_yes is None and not self.probabilities:
+            raise ValueError("Prediction requires p_yes or probabilities")
+        return self
 
 
 class Submission(BaseModel):

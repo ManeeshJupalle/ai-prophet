@@ -67,6 +67,61 @@ def test_predict_skips_market_with_malformed_agent_response(monkeypatch, tmp_pat
     assert [p["market_ticker"] for p in submission["predictions"]] == ["TEST-GOOD"]
 
 
+def test_predict_accepts_probability_distribution_response(monkeypatch, tmp_path):
+    events_path = tmp_path / "events.json"
+    output_path = tmp_path / "submission.json"
+    close_time = (datetime.now(UTC) + timedelta(days=1)).isoformat()
+    events_path.write_text(json.dumps([
+        {
+            "market_ticker": "TEST-MULTI",
+            "close_time": close_time,
+        },
+    ]))
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "probabilities": [
+                    {"market": "Pittsburgh", "probability": 68},
+                    {"market": "Atlanta", "probability": 32},
+                ]
+            }
+
+    def fake_post(*_args, **_kwargs):
+        return FakeResponse()
+
+    monkeypatch.setattr("ai_prophet.forecast.main.requests.post", fake_post)
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "forecast",
+            "predict",
+            "--events",
+            str(events_path),
+            "--agent-url",
+            "http://agent.test/predict",
+            "--output",
+            str(output_path),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "TEST-MULTI: probabilities=[Pittsburgh=0.680, Atlanta=0.320]" in result.output
+
+    submission = json.loads(output_path.read_text())
+    prediction = submission["predictions"][0]
+    assert prediction["market_ticker"] == "TEST-MULTI"
+    assert prediction["probabilities"] == [
+        {"market": "Pittsburgh", "probability": 0.68},
+        {"market": "Atlanta", "probability": 0.32},
+    ]
+    assert "p_yes" not in prediction
+
+
 def test_retrieve_defaults_to_dataset_source(monkeypatch, tmp_path):
     output_path = tmp_path / "events.json"
     captured = {}

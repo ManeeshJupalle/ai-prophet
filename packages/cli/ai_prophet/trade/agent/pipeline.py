@@ -9,11 +9,11 @@ from typing import Any
 
 from ai_prophet_core.client import ServerAPIClient
 
+from ai_prophet.search import SearchClient
 from ai_prophet.trade.core import EventStore, TickContext, TickState
 from ai_prophet.trade.core.config import ClientConfig
 from ai_prophet.trade.llm import LLMClient
 from ai_prophet.trade.llm.base import vprint
-from ai_prophet.trade.search import SearchClient
 
 from .stages import (
     ActionStage,
@@ -95,7 +95,8 @@ class AgentPipeline:
         search_client: SearchClient | None = self.config.get("search_client")
         self.search_client = search_client
         if search_client:
-            logger.info("Using real search (Brave API)")
+            provider_name = getattr(search_client, "provider_name", "configured provider")
+            logger.info("Using real search (%s)", provider_name)
         else:
             logger.info("Search disabled (no search_client provided)")
 

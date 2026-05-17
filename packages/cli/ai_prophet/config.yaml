@@ -2,6 +2,10 @@
 # Copy to config.local.yaml to override (gitignored)
 
 search:
+  provider: brave
+  as_of: null                  # YYYY-MM-DD enables cutoff filtering by default
+  missing_date_policy: reject  # reject | allow
+  sandbox_fetch_multiplier: 2  # request extra candidates before local cutoff filtering
   max_queries_per_market: 1
   max_results_per_query: 3
   mock: false

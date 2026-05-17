@@ -180,8 +180,13 @@ source for the version you have installed.
 - **Positions are keyed by `(market_id, side)`.** Stacking 10 shares of
   YES across multiple ticks accumulates into one position with a
   blended `avg_entry_price`.
-- **You cannot hold both YES and NO on the same market.** The server
-  rejects any intent for the opposite side of a held position.
+- **You cannot hold both YES and NO on the same market.** Submitting a
+  BUY on the opposite side of a held position does **not** open a second
+  position and is **not** rejected — the server treats it as a reduction
+  of the existing position. Shares get netted off until the holding
+  reaches zero; any remaining shares from your intent are dropped (they
+  do not flip you to the other side). To flip, first SELL down to flat,
+  then BUY the new side in a follow-up intent.
 - **Unrealized PnL** is mark-to-market at the snapshot's mid-price for
   open positions. **Realized PnL** comes from market resolution: payouts
   are $1 per share on the winning side, $0 on the losing side.
@@ -217,7 +222,7 @@ directly, read it from `claim_tick`'s response and pass it explicitly.
 
 ### Markets that "vanish"
 
-Polymarket markets can drop out of the eligible universe between ticks.
+Kalshi markets can drop out of the eligible universe between ticks.
 Open positions on a dropped market are excluded from equity until the
 market resolves (or returns). Plan accordingly.
 

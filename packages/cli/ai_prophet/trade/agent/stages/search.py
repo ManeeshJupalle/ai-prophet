@@ -5,10 +5,10 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from ai_prophet.search import SearchClient
 from ai_prophet.trade.core import TickContext
 from ai_prophet.trade.llm import LLMClient, LLMMessage
 from ai_prophet.trade.llm.base import vprint
-from ai_prophet.trade.search import SearchClient
 
 from ..tool_schemas import SEARCH_SUMMARY_TOOL
 from ..validator import SchemaValidator
@@ -179,7 +179,7 @@ class SearchStage(PipelineStage):
             logger.info("Search disabled: no search client configured")
             return []
 
-        # Real search mode: Use Brave Search API
+        # Real search mode: use the configured SearchClient provider.
         logger.debug(f"Executing {len(queries_to_run)} search queries")
         all_results = []
         for query in queries_to_run:
@@ -269,4 +269,3 @@ Summarize the key findings relevant to forecasting this market."""
             "key_points": [],
             "open_questions": [reason],
         }
-

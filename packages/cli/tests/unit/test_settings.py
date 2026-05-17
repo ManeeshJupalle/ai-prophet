@@ -16,6 +16,9 @@ def test_default_credentials():
     assert creds.gemini_api_key is None
     assert creds.xai_api_key is None
     assert creds.brave_api_key is None
+    assert creds.exa_api_key is None
+    assert creds.tavily_api_key is None
+    assert creds.perplexity_api_key is None
     assert creds.verbose is False
 
 
@@ -28,6 +31,9 @@ def test_from_env(monkeypatch):
     monkeypatch.setenv("GEMINI_API_KEY", "gem_key_789")
     monkeypatch.setenv("XAI_API_KEY", "xai_key_abc")
     monkeypatch.setenv("BRAVE_API_KEY", "brave_key_def")
+    monkeypatch.setenv("EXA_API_KEY", "exa_key")
+    monkeypatch.setenv("TAVILY_API_KEY", "tavily_key")
+    monkeypatch.setenv("PERPLEXITY_API_KEY", "pplx_key")
     monkeypatch.setenv("PA_VERBOSE", "true")
 
     creds = Credentials.from_env()
@@ -39,6 +45,9 @@ def test_from_env(monkeypatch):
     assert creds.gemini_api_key == "gem_key_789"
     assert creds.xai_api_key == "xai_key_abc"
     assert creds.brave_api_key == "brave_key_def"
+    assert creds.exa_api_key == "exa_key"
+    assert creds.tavily_api_key == "tavily_key"
+    assert creds.perplexity_api_key == "pplx_key"
     assert creds.verbose is True
 
 
@@ -93,6 +102,23 @@ def test_get_api_key():
     assert creds.get_api_key("unknown") is None
 
 
+def test_get_search_api_key(monkeypatch):
+    creds = Credentials(
+        brave_api_key="brave",
+        exa_api_key="exa",
+        tavily_api_key="tavily",
+        perplexity_api_key="perplexity",
+    )
+
+    assert creds.get_search_api_key("brave") == "brave"
+    assert creds.get_search_api_key("exa") == "exa"
+    assert creds.get_search_api_key("tavily") == "tavily"
+    assert creds.get_search_api_key("perplexity") == "perplexity"
+
+    monkeypatch.setenv("CUSTOMSEARCH_API_KEY", "custom")
+    assert Credentials().get_search_api_key("customsearch") == "custom"
+
+
 def test_get_api_key_unknown_provider_from_env(monkeypatch):
     """Test generic OpenAI-compatible providers resolve through env vars."""
     monkeypatch.setenv("TOGETHER_API_KEY", "together")
@@ -117,11 +143,13 @@ def test_repr_masks_secrets():
     creds = Credentials(
         anthropic_api_key="secret_key_123",
         brave_api_key="another_secret",
+        exa_api_key="exa_secret",
     )
     r = repr(creds)
 
     assert "secret_key_123" not in r
     assert "another_secret" not in r
+    assert "exa_secret" not in r
     assert "***" in r
 
 
@@ -134,5 +162,4 @@ def test_verbose_flag_values(monkeypatch):
     for falsy in ("false", "0", "no", ""):
         monkeypatch.setenv("PA_VERBOSE", falsy)
         assert Credentials.from_env().verbose is False
-
 

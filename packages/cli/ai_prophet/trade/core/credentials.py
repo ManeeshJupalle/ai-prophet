@@ -44,6 +44,9 @@ class Credentials:
     gemini_api_key: str | None = None
     xai_api_key: str | None = None
     brave_api_key: str | None = None
+    exa_api_key: str | None = None
+    tavily_api_key: str | None = None
+    perplexity_api_key: str | None = None
     verbose: bool = False
 
     @classmethod
@@ -64,6 +67,9 @@ class Credentials:
             gemini_api_key=(os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")),
             xai_api_key=os.getenv("XAI_API_KEY"),
             brave_api_key=os.getenv("BRAVE_API_KEY"),
+            exa_api_key=os.getenv("EXA_API_KEY"),
+            tavily_api_key=os.getenv("TAVILY_API_KEY"),
+            perplexity_api_key=os.getenv("PERPLEXITY_API_KEY"),
             verbose=os.getenv("PA_VERBOSE", "").lower() in ("true", "1", "yes"),
         )
 
@@ -89,6 +95,20 @@ class Credentials:
         # Support provider-specific API keys like TOGETHER_API_KEY.
         env_key = f"{provider_name.upper()}_API_KEY"
         return os.getenv(env_key)
+
+    def get_search_api_key(self, provider: str) -> str | None:
+        """Get API key for a supported search provider."""
+        keys: dict[str, str | None] = {
+            "brave": self.brave_api_key,
+            "exa": self.exa_api_key,
+            "tavily": self.tavily_api_key,
+            "perplexity": self.perplexity_api_key,
+        }
+        provider_name = provider.strip().lower()
+        direct = keys.get(provider_name)
+        if direct:
+            return direct
+        return os.getenv(f"{provider_name.upper()}_API_KEY")
 
     def has_api_key(self, provider: str) -> bool:
         """True if a provider-specific API key is configured."""
@@ -120,6 +140,9 @@ class Credentials:
             f"gemini={_mask(self.gemini_api_key)}, "
             f"xai={_mask(self.xai_api_key)}, "
             f"brave={_mask(self.brave_api_key)}, "
+            f"exa={_mask(self.exa_api_key)}, "
+            f"tavily={_mask(self.tavily_api_key)}, "
+            f"perplexity={_mask(self.perplexity_api_key)}, "
             f"verbose={self.verbose})"
         )
 
@@ -130,4 +153,3 @@ __all__ = [
     "load_dotenv_file",
     "normalize_provider_name",
 ]
-

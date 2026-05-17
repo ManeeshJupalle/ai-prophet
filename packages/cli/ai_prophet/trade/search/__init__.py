@@ -1,6 +1,8 @@
-"""Search client for web content retrieval."""
+"""Compatibility import for search tools.
 
-from .client import SearchClient
+Prefer importing from ``ai_prophet.search``.
+"""
+
+from ai_prophet.search import SearchClient
 
 __all__ = ["SearchClient"]
-

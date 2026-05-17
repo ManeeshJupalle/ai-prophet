@@ -15,6 +15,7 @@ import click
 from ai_prophet_core.client import ServerAPIClient
 from ai_prophet_core.dashboard import open_dashboard
 
+from ai_prophet.search import SearchClient
 from ai_prophet.trade.agent.pipeline import AgentPipeline
 from ai_prophet.trade.core.config import ClientConfig
 from ai_prophet.trade.core.credentials import (
@@ -24,7 +25,6 @@ from ai_prophet.trade.core.credentials import (
 )
 from ai_prophet.trade.llm import create_llm_client
 from ai_prophet.trade.runner import ExperimentRunner, _bump_slug, compute_config_hash
-from ai_prophet.trade.search import SearchClient
 
 logger = logging.getLogger(__name__)
 
@@ -306,10 +306,15 @@ def _make_pipeline_builder(
         )
 
         search_client = None
-        if creds.brave_api_key:
+        search_provider = client_config.search.provider
+        search_api_key = creds.get_search_api_key(search_provider)
+        if search_api_key:
             search_client = SearchClient(
-                api_key=creds.brave_api_key,
+                api_key=search_api_key,
                 config=client_config.search,
+                provider=search_provider,
+                as_of=client_config.search.as_of,
+                missing_date_policy=client_config.search.missing_date_policy,
             )
         api_client = ServerAPIClient(base_url=api_url, api_key=server_api_key)
 
@@ -435,7 +440,7 @@ def dashboard(api_url, slug):
     api_url = api_url or creds.server_url
 
     click.echo("Trade Benchmark Dashboard")
-    open_dashboard(api_url=api_url, slug=slug or "", api_key=creds.server_api_key)
+    open_dashboard(api_url=api_url, slug=slug or "", api_key=creds.server_api_key, block=True)
 
 
 def main():

@@ -42,6 +42,35 @@ def retrieve_dataset_events(
     Returns:
         ``(events, dataset_name, release_id)``.
     """
+    task_rows, dataset_name, release_id = retrieve_dataset_tasks(
+        dataset=dataset,
+        release_id=release_id,
+        repo_path=repo_path,
+        repo_url=repo_url,
+        branch=branch,
+    )
+    if not include_resolved:
+        task_rows = [row for row in task_rows if row.get("resolved_outcome") is None]
+
+    events = [_event_from_task(row) for row in task_rows]
+    logger.info(
+        "Retrieved %d event(s) from %s/%s",
+        len(events),
+        dataset_name,
+        release_id,
+    )
+    return events, dataset_name, release_id
+
+
+def retrieve_dataset_tasks(
+    *,
+    dataset: str | None = None,
+    release_id: str | None = None,
+    repo_path: str | None = None,
+    repo_url: str | None = None,
+    branch: str | None = None,
+) -> tuple[list[dict[str, Any]], str, str]:
+    """Fetch raw task rows from the forecasting dataset registry."""
     dataset_name = dataset or os.environ.get(DATASET_ENV) or DEFAULT_DATASET
     selected_release = release_id or os.environ.get(RELEASE_ENV)
     selected_branch = branch or os.environ.get(BRANCH_ENV) or "main"
@@ -62,17 +91,7 @@ def retrieve_dataset_events(
         repo_url=selected_repo_url,
         branch=selected_branch,
     )
-    if not include_resolved:
-        task_rows = [row for row in task_rows if row.get("resolved_outcome") is None]
-
-    events = [_event_from_task(row) for row in task_rows]
-    logger.info(
-        "Retrieved %d event(s) from %s/%s",
-        len(events),
-        dataset_name,
-        release["id"],
-    )
-    return events, dataset_name, release["id"]
+    return task_rows, dataset_name, release["id"]
 
 
 def _load_registry(

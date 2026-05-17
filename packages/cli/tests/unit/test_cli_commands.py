@@ -47,6 +47,32 @@ def test_health_command_reports_service_status(monkeypatch):
     assert "Version: 1.2.3" in result.output
 
 
+def test_dashboard_command_blocks_local_server(monkeypatch):
+    runner = CliRunner()
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        "ai_prophet.trade.main._load_runtime_credentials",
+        lambda: Credentials(server_url="http://example.test", server_api_key="server-key"),
+    )
+
+    def fake_open_dashboard(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr("ai_prophet.trade.main.open_dashboard", fake_open_dashboard)
+
+    result = runner.invoke(cli, ["trade", "dashboard", "--slug", "dashboard_smoke_test"])
+
+    assert result.exit_code == 0
+    assert "Trade Benchmark Dashboard" in result.output
+    assert captured == {
+        "api_url": "http://example.test",
+        "slug": "dashboard_smoke_test",
+        "api_key": "server-key",
+        "block": True,
+    }
+
+
 def test_eval_run_passes_explicit_runtime_config_to_runner(monkeypatch):
     runner = CliRunner()
     runtime_config = ClientConfig.from_mapping(

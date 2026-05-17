@@ -14,13 +14,14 @@ import logging
 import os
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import click
 import requests
 from ai_prophet_core.client import ServerAPIClient
 from ai_prophet_core.forecast.dataset_retrieve import retrieve_dataset_events
 from ai_prophet_core.forecast.evaluate import load_actuals, load_submission, score
-from ai_prophet_core.forecast.schemas import Prediction, Submission
+from ai_prophet_core.forecast.schemas import MarketProbability, Prediction, Submission
 
 logger = logging.getLogger(__name__)
 
@@ -396,15 +397,29 @@ def predict(
                 resp.raise_for_status()
                 result = resp.json()
 
-            p_yes = float(result["p_yes"])
-            predictions.append(
-                Prediction(
-                    market_ticker=market_ticker,
-                    p_yes=p_yes,
-                    rationale=result.get("rationale"),
+            if "probabilities" in result:
+                probabilities = _normalize_probabilities(result["probabilities"])
+                predictions.append(
+                    Prediction(
+                        market_ticker=market_ticker,
+                        probabilities=probabilities,
+                        rationale=result.get("rationale"),
+                    )
                 )
-            )
-            click.echo(f"  {market_ticker}: p_yes={p_yes:.3f}")
+                summary = ", ".join(
+                    f"{p.market}={p.probability:.3f}" for p in probabilities
+                )
+                click.echo(f"  {market_ticker}: probabilities=[{summary}]")
+            else:
+                p_yes = float(result["p_yes"])
+                predictions.append(
+                    Prediction(
+                        market_ticker=market_ticker,
+                        p_yes=p_yes,
+                        rationale=result.get("rationale"),
+                    )
+                )
+                click.echo(f"  {market_ticker}: p_yes={p_yes:.3f}")
         except Exception as e:
             logger.warning("Skipping %s: %s", market_ticker, e)
             click.echo(f"  {market_ticker}: SKIPPED ({e})")
@@ -419,8 +434,50 @@ def predict(
     )
 
     out_path = Path(output)
-    out_path.write_text(submission.model_dump_json(indent=2))
+    out_path.write_text(submission.model_dump_json(indent=2, exclude_none=True))
     click.echo(f"\nPredictions ({len(predictions)} markets) -> {out_path}")
+
+
+def _normalize_probabilities(raw: Any) -> list[MarketProbability]:
+    """Validate and normalize an agent probability-distribution response."""
+    if isinstance(raw, dict):
+        items = [
+            {"market": market, "probability": probability}
+            for market, probability in raw.items()
+        ]
+    elif isinstance(raw, list):
+        items = raw
+    else:
+        raise TypeError("probabilities must be a list or object")
+
+    values = [
+        (str(item["market"]), float(item["probability"]))
+        for item in items
+    ]
+    if any(probability > 1.0 for _market, probability in values):
+        values = [(market, probability / 100) for market, probability in values]
+
+    probabilities = [
+        MarketProbability(
+            market=market,
+            probability=max(0.0, min(1.0, probability)),
+        )
+        for market, probability in values
+    ]
+    if not probabilities:
+        raise ValueError("probabilities must contain at least one entry")
+
+    total = sum(item.probability for item in probabilities)
+    if total <= 0:
+        raise ValueError("probabilities must sum to a positive value")
+
+    return [
+        MarketProbability(
+            market=item.market,
+            probability=item.probability / total,
+        )
+        for item in probabilities
+    ]
 
 
 @cli.command(name="evaluate")
