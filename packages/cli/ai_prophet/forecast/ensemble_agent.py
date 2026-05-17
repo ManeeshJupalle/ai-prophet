@@ -760,6 +760,45 @@ def predict(event: dict, *, _skip_pacing: bool = False) -> dict:
 # ---------------------------------------------------------------------------
 
 
+def _extract_markets(event_dict: dict) -> list[str]:
+    """Pull the list of market/outcome names from an event payload.
+
+    Different upstream shapes use different field names. We try, in order:
+
+    * ``outcomes`` — canonical ``Event`` schema (``list[str]``)
+    * ``markets`` — alternate shape; values may be plain strings OR dicts
+      with one of ``market_name`` / ``name`` / ``market_id`` /
+      ``market_ticker`` / ``ticker`` as the readable label.
+
+    Returns a flat ``list[str]``; empty list if no list-of-markets field
+    is present or usable.
+    """
+    raw = event_dict.get("outcomes")
+    if isinstance(raw, list) and raw and all(isinstance(x, str) for x in raw):
+        return list(raw)
+
+    raw = event_dict.get("markets")
+    if isinstance(raw, list) and raw:
+        if all(isinstance(x, str) for x in raw):
+            return list(raw)
+        out: list[str] = []
+        for item in raw:
+            if isinstance(item, dict):
+                name = (
+                    item.get("market_name")
+                    or item.get("name")
+                    or item.get("market_id")
+                    or item.get("market_ticker")
+                    or item.get("ticker")
+                )
+                if name:
+                    out.append(str(name))
+        if out:
+            return out
+
+    return []
+
+
 def _handle_single_event(event_dict: dict) -> dict:
     """Run one event through the cached + pacing-free pipeline.
 
@@ -784,9 +823,21 @@ def _handle_single_event(event_dict: dict) -> dict:
         if isinstance(event_dict, dict)
         else ""
     )
-    outcomes = (
-        event_dict.get("outcomes") if isinstance(event_dict, dict) else None
-    ) or []
+
+    # Discover the markets/outcomes list — different upstream shapes use
+    # different field names. ``outcomes`` is the canonical Event schema
+    # field (list[str]); ``markets`` is used by some payloads as a list
+    # of dicts with ``market_name``/``market_id`` entries. Accept both.
+    outcomes = _extract_markets(event_dict) if isinstance(event_dict, dict) else []
+
+    if isinstance(event_dict, dict):
+        logger.info(
+            "endpoint.predict shape event_ticker=%s keys=%s outcomes_n=%d sample=%s",
+            event_t,
+            sorted(event_dict.keys()),
+            len(outcomes),
+            outcomes[:4],
+        )
 
     if isinstance(outcomes, list) and len(outcomes) > 2:
         logger.info(
