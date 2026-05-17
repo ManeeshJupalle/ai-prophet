@@ -28,7 +28,13 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from .cache import cache_enabled, cache_prediction, get_cached_prediction
+from .cache import (
+    cache_enabled,
+    cache_multi_outcome,
+    cache_prediction,
+    get_cached_multi_outcome,
+    get_cached_prediction,
+)
 from .ensemble import P_MAX, P_MIN, FinalPrediction, ensemble_predict
 from .llm_utils import call_llm_json, fast_resolve
 from .market_signal import market_signal_estimate
@@ -879,13 +885,31 @@ def _handle_multi_outcome_event(event_dict: dict, outcomes: list[str]) -> dict:
 
     Returns ``{probabilities: [{market, probability}, ...], rationale}`` —
     the array shape the forecasting harness expects for distribution
-    responses. Research is gathered first so the LLM has sources to ground
-    on; any failure falls back to a uniform distribution.
+    responses. The pipeline is:
 
-    The per-market probabilities are clamped to ``[P_MIN, P_MAX]`` inside
-    :func:`_predict_multi_outcome`, then sum-normalized here so the array
-    is a valid probability distribution.
+    1. Cache lookup keyed on ``market_ticker``. Hits skip all LLM work.
+    2. Otherwise: gather research, single multi-outcome LLM call.
+    3. Sum-normalize so the array is a valid probability distribution.
+    4. Cache the result under the event's TTL.
+
+    Research / LLM failures fall back to a uniform distribution so the
+    harness never sees a malformed shape.
     """
+    ticker = event_dict.get("market_ticker")
+
+    if cache_enabled():
+        cached = get_cached_multi_outcome(ticker)
+        if cached is not None:
+            logger.info(
+                "predict.cache_hit ticker=%s shape=multi expires_at=%s",
+                ticker,
+                cached.get("expires_at"),
+            )
+            return {
+                "probabilities": cached["probabilities"],
+                "rationale": cached["rationale"],
+            }
+
     title = str(event_dict.get("title") or "(untitled event)")
     description = event_dict.get("description")
     category = event_dict.get("category")
@@ -917,9 +941,14 @@ def _handle_multi_outcome_event(event_dict: dict, outcomes: list[str]) -> dict:
     if total > 0:
         for p in probs_array:
             p["probability"] = p["probability"] / total
+    rationale = str(content.get("rationale") or "")[:1500]
+
+    if cache_enabled():
+        cache_multi_outcome(ticker, probs_array, rationale)
+
     return {
         "probabilities": probs_array,
-        "rationale": str(content.get("rationale") or "")[:1500],
+        "rationale": rationale,
     }
 
 

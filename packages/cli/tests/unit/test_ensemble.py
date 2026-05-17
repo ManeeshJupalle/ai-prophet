@@ -1309,6 +1309,52 @@ def test_predict_multi_outcome_returns_probabilities_array(
     assert total == pytest.approx(1.0, abs=1e-6)
 
 
+def test_predict_multi_outcome_uses_cache_on_repeat(monkeypatch, tmp_path) -> None:
+    """A repeat call with the same market_ticker should skip the LLM and serve cache."""
+    from ai_prophet.forecast import ensemble_agent
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setenv("PREDICTION_CACHE_PATH", str(tmp_path / "cache.json"))
+    monkeypatch.setenv("ENABLE_CACHE", "true")
+
+    monkeypatch.setattr(
+        ensemble_agent, "research_event", lambda **_kw: "(stubbed)"
+    )
+
+    call_count = {"n": 0}
+
+    def fake_multi(title, markets, research):
+        call_count["n"] += 1
+        return {
+            "rationale": f"call #{call_count['n']}",
+            "probabilities": {m: 1.0 / len(markets) for m in markets},
+        }
+
+    monkeypatch.setattr(ensemble_agent, "_predict_multi_outcome", fake_multi)
+
+    client = TestClient(ensemble_agent.app)
+    payload = {
+        "event_ticker": "NBA-2026",
+        "market_ticker": "NBA-CHAMP-2026",
+        "title": "Who will win?",
+        "outcomes": ["A", "B", "C", "D"],
+    }
+
+    first = client.post("/predict", json=payload)
+    second = client.post("/predict", json=payload)
+    third = client.post("/predict", json=payload)
+
+    assert first.status_code == second.status_code == third.status_code == 200
+    # LLM ran exactly once across the three calls — subsequent calls served from cache.
+    assert call_count["n"] == 1
+    # Shape is preserved on cache hits.
+    for resp in (first, second, third):
+        body = resp.json()
+        assert isinstance(body["probabilities"], list)
+        assert len(body["probabilities"]) == 4
+        assert all("market" in p and "probability" in p for p in body["probabilities"])
+
+
 def test_predict_two_outcomes_still_returns_p_yes(monkeypatch, tmp_path) -> None:
     """Binary (2-outcome) events keep returning the legacy {p_yes, rationale} shape."""
     from ai_prophet.forecast import ensemble_agent

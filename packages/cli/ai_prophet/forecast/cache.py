@@ -113,10 +113,12 @@ def _is_expired(entry: dict[str, Any], now: datetime | None = None) -> bool:
 
 
 def get_cached_prediction(market_ticker: str | None) -> dict[str, Any] | None:
-    """Return the cached prediction for ``market_ticker`` if valid; else ``None``.
+    """Return the cached **binary** prediction for ``market_ticker`` or ``None``.
 
-    Returns ``None`` for empty tickers, missing entries, and expired entries.
-    The returned dict is a copy — callers can mutate it safely.
+    Only entries that contain ``p_yes`` are returned — a multi-outcome entry
+    (distribution shape) sharing the same ticker is ignored to avoid handing
+    the wrong shape to a binary caller. ``None`` for empty tickers, missing
+    entries, expired entries, or wrong-shape entries.
     """
     if not market_ticker:
         return None
@@ -128,6 +130,8 @@ def get_cached_prediction(market_ticker: str | None) -> dict[str, Any] | None:
             return None
         if _is_expired(entry):
             return None
+        if "p_yes" not in entry:
+            return None
         return dict(entry)
 
 
@@ -138,13 +142,63 @@ def cache_prediction(
     *,
     ttl_hours: float | None = None,
 ) -> None:
-    """Write a fresh entry for ``market_ticker``. No-op if the ticker is empty."""
+    """Write a fresh binary entry for ``market_ticker``. No-op if empty."""
     if not market_ticker:
         return
     ttl = ttl_hours if ttl_hours is not None else _ttl_hours()
     now = _now()
     entry = {
         "p_yes": float(p_yes),
+        "rationale": str(rationale),
+        "timestamp": now.isoformat(),
+        "expires_at": (now + timedelta(hours=ttl)).isoformat(),
+    }
+    path = _cache_path()
+    with _lock:
+        cache = _load_cache(path)
+        cache[market_ticker] = entry
+        _save_cache(path, cache)
+
+
+def get_cached_multi_outcome(market_ticker: str | None) -> dict[str, Any] | None:
+    """Return the cached **multi-outcome** prediction for ``market_ticker`` or ``None``.
+
+    Mirror of :func:`get_cached_prediction` for distribution-shape entries.
+    Only entries that contain ``probabilities`` (a list of
+    ``{market, probability}`` dicts) are returned.
+    """
+    if not market_ticker:
+        return None
+    path = _cache_path()
+    with _lock:
+        cache = _load_cache(path)
+        entry = cache.get(market_ticker)
+        if entry is None:
+            return None
+        if _is_expired(entry):
+            return None
+        probs = entry.get("probabilities")
+        if not isinstance(probs, list) or not probs:
+            return None
+        return dict(entry)
+
+
+def cache_multi_outcome(
+    market_ticker: str | None,
+    probabilities: list[dict[str, Any]],
+    rationale: str,
+    *,
+    ttl_hours: float | None = None,
+) -> None:
+    """Write a multi-outcome entry. ``probabilities`` is the array shape we
+    return to callers: ``[{"market": str, "probability": float}, ...]``.
+    """
+    if not market_ticker:
+        return
+    ttl = ttl_hours if ttl_hours is not None else _ttl_hours()
+    now = _now()
+    entry = {
+        "probabilities": list(probabilities),
         "rationale": str(rationale),
         "timestamp": now.isoformat(),
         "expires_at": (now + timedelta(hours=ttl)).isoformat(),
@@ -186,8 +240,10 @@ __all__ = [
     "DEFAULT_CACHE_PATH",
     "DEFAULT_TTL_HOURS",
     "cache_enabled",
-    "get_cached_prediction",
+    "cache_multi_outcome",
     "cache_prediction",
-    "clear_expired",
     "clear_all",
+    "clear_expired",
+    "get_cached_multi_outcome",
+    "get_cached_prediction",
 ]
