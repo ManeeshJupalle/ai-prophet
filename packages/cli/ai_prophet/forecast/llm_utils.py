@@ -342,3 +342,126 @@ def call_llm_json(
     except json.JSONDecodeError:
         salvaged = _extract_json_object(candidate)
         return json.loads(salvaged)
+
+
+# ---------------------------------------------------------------------------
+# Smart routing: fast-resolve for already-settled Sports events
+# ---------------------------------------------------------------------------
+
+# Phrases that suggest a sports result has been reported in the research.
+_RESULT_KEYWORDS = (
+    " won ", " wins ", " winner ", " victory ", " defeat", " defeated",
+    " beat ", " beats ", " loses to ", " lost to ", "final score",
+    "final result", "knockout", "advances to", "eliminated",
+)
+
+# Score patterns like "115-94", "3 - 1", "115–94" (em-dash also tolerated).
+_SCORE_PATTERN = re.compile(r"\b\d{1,3}\s*[-–]\s*\d{1,3}\b")
+
+_FAST_RESOLVE_CONFIDENCE = 0.95
+"""Confidence for fast-resolved events. Near-max because we're literally
+quoting a reported result, but not 1.0 so the ensemble math is still safe
+if the LLM mis-identifies which match the research is about."""
+
+_FAST_RESOLVE_SYSTEM_PROMPT = """You decide whether a Sports prediction-market
+question has already been settled by a result quoted in the research brief.
+
+The user prompt provides:
+* The question (e.g. "Will Cleveland beat Detroit in NBA Game 6?").
+* OUTCOMES naming which side maps to YES and which to NO.
+* A research brief.
+
+Your procedure:
+1. Look in the research for a definitive result of the SPECIFIC match the
+   question asks about — same teams, same competition, same date if given.
+2. If you find it, set ``settled: true`` and ``p_yes`` near 0.97 if the
+   YES side won, or near 0.03 if the NO side won.
+3. If the research mentions a result for the wrong match/date, or the
+   result is ambiguous, or you'd be guessing, set ``settled: false`` and
+   ``p_yes: 0.5``. The caller will then run the full forecasting pipeline.
+
+Be conservative: false-positive fast-resolves are catastrophic for Brier.
+
+Respond with ONLY a JSON object:
+{"settled": true|false, "p_yes": <float 0.01-0.99>,
+ "rationale": "<one short sentence quoting the specific match/score>"}
+
+No prose, no markdown fences, no commentary."""
+
+
+def _research_has_result_signal(research: str) -> bool:
+    """Cheap pre-filter: does the research mention a result at all?"""
+    if not research:
+        return False
+    lower = research.lower()
+    if _SCORE_PATTERN.search(research):
+        return True
+    return any(kw in lower for kw in _RESULT_KEYWORDS)
+
+
+def fast_resolve(event: Any, research: str) -> Any | None:
+    """Skip the full pipeline for Sports events whose result is already public.
+
+    For events where category == "Sports" AND the research brief mentions a
+    result-like signal (score pattern, "won"/"beat"/etc.), make one cheap
+    LLM call that decides whether the brief actually settles the question.
+    Returns an :class:`Estimate` with confidence 0.95 if so, else ``None``.
+
+    Returning ``None`` means "no fast-resolve; run the full pipeline" — the
+    caller treats both "not applicable" and "ambiguous" the same way.
+    """
+    # Lazy import to avoid a circular dependency at module load.
+    from .strategies.base import Estimate, clamp_probability
+
+    category = (getattr(event, "category", None) or "").strip().lower()
+    if category != "sports":
+        return None
+
+    if not _research_has_result_signal(research):
+        return None
+
+    title = getattr(event, "title", "") or ""
+    outcomes = getattr(event, "outcomes", None) or []
+
+    lines = [f"Question: {title}"]
+    if isinstance(outcomes, list) and len(outcomes) >= 2:
+        lines.append(f"OUTCOMES: YES = {outcomes[0]}, NO = {outcomes[1]}")
+    lines.append("")
+    lines.append("Research brief:")
+    lines.append((research or "")[:3000])  # cap input — LLM doesn't need 8K
+    lines.append("")
+    lines.append(
+        "Has THIS specific match been settled? If yes, who won? "
+        "Return JSON only."
+    )
+
+    try:
+        data = call_llm_json(
+            _FAST_RESOLVE_SYSTEM_PROMPT,
+            "\n".join(lines),
+            tier="research",
+            temperature=0.0,
+            max_tokens=300,
+        )
+    except Exception as exc:  # noqa: BLE001 — never break the pipeline
+        logger.info("fast_resolve LLM call failed: %s", exc)
+        return None
+
+    try:
+        settled = bool(data.get("settled", False))
+        p_raw = float(data["p_yes"])
+        rationale = str(data.get("rationale", "")).strip() or "(no rationale)"
+    except (KeyError, TypeError, ValueError) as exc:
+        logger.info("fast_resolve bad payload: %s", exc)
+        return None
+
+    # Refuse to short-circuit if the LLM came back uncertain.
+    if not settled or 0.4 <= p_raw <= 0.6:
+        return None
+
+    return Estimate(
+        p_yes=clamp_probability(p_raw),
+        rationale=f"Fast-resolve: {rationale}",
+        strategy="fast_resolve",
+        confidence=_FAST_RESOLVE_CONFIDENCE,
+    )

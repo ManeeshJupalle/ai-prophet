@@ -16,17 +16,22 @@ so the same agent can be served over HTTP via ``--agent-url``.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import re
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import replace
 from typing import Any
 
 from pydantic import BaseModel
 
 from .cache import cache_enabled, cache_prediction, get_cached_prediction
-from .ensemble import FinalPrediction, ensemble_predict
-from .llm_utils import call_llm_json
+from .ensemble import P_MAX, P_MIN, FinalPrediction, ensemble_predict
+from .llm_utils import call_llm_json, fast_resolve
+from .market_signal import market_signal_estimate
 from .researcher import research_event
 from .strategies import (
     BaseRateStrategy,
@@ -265,6 +270,168 @@ def _resolved_outcome_value(raw: Any) -> str | None:
     return None
 
 
+# Phrases in the evidence rationale that signal the analyst had no usable
+# web research to work with. Used by :func:`_research_was_weak` together
+# with a simple length floor on the research brief.
+_WEAK_RESEARCH_PHRASES = (
+    "no web evidence",
+    "no research available",
+    "research brief is empty",
+    "research is sparse",
+    "no relevant sources",
+    "(no research available)",
+)
+
+_WEAK_RESEARCH_MIN_CHARS = 500
+
+
+def _research_was_weak(research: str, estimates: list[Estimate]) -> bool:
+    """Return True when the evidence analyst effectively flew blind.
+
+    Triggers if the research brief is under ``_WEAK_RESEARCH_MIN_CHARS`` chars
+    OR the evidence strategy's rationale contains one of the known
+    "I had nothing to work with" phrases.
+    """
+    if len(research or "") < _WEAK_RESEARCH_MIN_CHARS:
+        return True
+    for est in estimates:
+        if est.strategy != "evidence_weighted":
+            continue
+        low = (est.rationale or "").lower()
+        if any(phrase in low for phrase in _WEAK_RESEARCH_PHRASES):
+            return True
+    return False
+
+
+def _rebalance_on_weak_research(estimates: list[Estimate]) -> list[Estimate]:
+    """Downweight evidence to 0.3 and boost base-rate to 0.7.
+
+    When the agent has poor research, the Bayesian-correct move is to lean
+    on priors (base-rate) rather than overweight a thin evidence read.
+    Contrarian and market_consensus estimates are left untouched.
+    """
+    rebalanced: list[Estimate] = []
+    for est in estimates:
+        if est.strategy == "evidence_weighted":
+            rebalanced.append(replace(est, confidence=0.3))
+        elif est.strategy == "base_rate":
+            rebalanced.append(replace(est, confidence=0.7))
+        else:
+            rebalanced.append(est)
+    return rebalanced
+
+
+# ---------------------------------------------------------------------------
+# Market anchoring
+# ---------------------------------------------------------------------------
+
+MARKET_ANCHOR_DELTA = 0.10
+"""``|ensemble - market| < MARKET_ANCHOR_DELTA`` → match the market price.
+Below this gap we don't have enough edge to be worth the Brier risk."""
+
+MARKET_ANCHOR_HIGH_AGREEMENT = 0.75
+"""Above this strategy-agreement threshold (with a large delta) we trust
+our ensemble over the market — our analysts converged on something the
+crowd may have missed."""
+
+MARKET_ANCHOR_BLEND_WEIGHTS = (0.6, 0.4)
+"""(market_weight, ensemble_weight) for the blend branch."""
+
+_MARKET_STRATEGY_NAMES = frozenset({"market_price", "market_consensus"})
+
+
+def _market_anchored_prediction(
+    final: FinalPrediction,
+    estimates: list[Estimate],
+    market_ticker: str | None = None,
+) -> FinalPrediction:
+    """Pull the final ``p_yes`` toward the market price unless we have edge.
+
+    The scoring formula is ``(our_brier - market_brier) * completion_rate``,
+    so by default we want to MATCH the market — deviating without conviction
+    can only cost us points. Four-branch decision tree:
+
+    1. **No market signal** in ``estimates`` → return the ensemble unchanged.
+    2. **``|ensemble - market| < 0.10``** → return the market price. The gap
+       is too small to justify deviating.
+    3. **``|delta| >= 0.10`` AND agreement > 0.75** → trust the ensemble.
+       Our strategies converged tightly on a different answer; that's alpha.
+    4. **``|delta| >= 0.10`` AND agreement <= 0.75** → blend
+       ``0.6 * market + 0.4 * ensemble``. We disagree with the market but
+       our own internals are uncertain too, so hedge.
+
+    The anchored ``p_yes`` is clamped to ``[P_MIN, P_MAX]`` so the
+    ``Prediction`` schema accepts it. Diagnostic fields (``raw_p_yes``,
+    ``agreement``, ``shrinkage``, ``estimates``) are preserved verbatim — we
+    only override ``p_yes`` and append a one-line anchor note to
+    ``rationale``.
+    """
+    market_p: float | None = None
+    for est in estimates:
+        if est.strategy in _MARKET_STRATEGY_NAMES:
+            market_p = est.p_yes
+            break
+
+    if market_p is None:
+        # Nothing to anchor to — let the ensemble result stand as-is.
+        return final
+
+    ensemble_p = final.p_yes
+    delta = ensemble_p - market_p
+    abs_delta = abs(delta)
+
+    if abs_delta < MARKET_ANCHOR_DELTA:
+        action = "match_market"
+        anchored_p = market_p
+    elif final.agreement > MARKET_ANCHOR_HIGH_AGREEMENT:
+        action = "use_ensemble"
+        anchored_p = ensemble_p
+    else:
+        action = "blend"
+        wm, we = MARKET_ANCHOR_BLEND_WEIGHTS
+        anchored_p = wm * market_p + we * ensemble_p
+
+    anchored_p = max(P_MIN, min(P_MAX, anchored_p))
+
+    logger.info(
+        "phase=market_anchor ticker=%s market_p=%.3f ensemble_p=%.3f "
+        "delta=%+.3f action=%s anchored_p=%.3f",
+        market_ticker,
+        market_p,
+        ensemble_p,
+        delta,
+        action,
+        anchored_p,
+    )
+
+    anchor_note = (
+        f"\n[market_anchor: action={action} market_p={market_p:.3f} "
+        f"ensemble_p={ensemble_p:.3f} agreement={final.agreement:.2f}]"
+    )
+    return replace(
+        final,
+        p_yes=anchored_p,
+        rationale=final.rationale + anchor_note,
+    )
+
+
+def _market_signal_task(
+    market_ticker: str | None, title: str | None
+) -> Estimate | None:
+    """Wrapper for the ThreadPoolExecutor — never raises.
+
+    Hands off to :func:`market_signal_estimate`, which tries Kalshi by
+    ticker first and falls back to Polymarket by fuzzy title.
+    """
+    if not market_ticker and not title:
+        return None
+    try:
+        return market_signal_estimate(market_ticker, title)
+    except Exception as exc:  # noqa: BLE001 — never break the pipeline
+        logger.info("market_signal crashed: %s", exc)
+        return None
+
+
 def _run_strategy(
     strategy: Any,
     event: EventRequest,
@@ -320,21 +487,50 @@ def forecast_event(event: EventRequest) -> FinalPrediction:
         time.perf_counter() - research_start,
     )
 
-    # Phase 2: parallel strategies
+    # Phase 1.5: fast-resolve smart routing for Sports events that already
+    # have a public result. Costs one cheap LLM call; if it returns a
+    # decisive estimate we skip the entire strategy pipeline.
+    fast_est = fast_resolve(event, research)
+    if fast_est is not None:
+        logger.info(
+            "phase=fast_resolve ticker=%s p_yes=%.3f conf=%.2f elapsed=%.2fs",
+            event.market_ticker,
+            fast_est.p_yes,
+            fast_est.confidence,
+            time.perf_counter() - overall_start,
+        )
+        return FinalPrediction(
+            p_yes=fast_est.p_yes,
+            rationale=fast_est.rationale,
+            raw_p_yes=fast_est.p_yes,
+            agreement=1.0,
+            shrinkage=0.0,
+            estimates=[fast_est],
+        )
+
+    # Phase 2: parallel strategies + market-consensus lookup (Polymarket).
+    # The 4 calls are independent so they all run on the same executor.
     strat_start = time.perf_counter()
     strategies = _build_strategies()
     estimates: list[Estimate] = []
-    with ThreadPoolExecutor(max_workers=len(strategies)) as pool:
-        futures = {
-            pool.submit(_run_strategy, s, event, research, temporal_ctx): s
+    with ThreadPoolExecutor(max_workers=len(strategies) + 1) as pool:
+        strategy_futures = [
+            pool.submit(_run_strategy, s, event, research, temporal_ctx)
             for s in strategies
-        }
-        for fut in as_completed(futures):
+        ]
+        market_future = pool.submit(
+            _market_signal_task, event.market_ticker, event.title
+        )
+        for fut in as_completed(strategy_futures):
             estimates.append(fut.result())
+        market_est = market_future.result()
+        if market_est is not None:
+            estimates.append(market_est)
     logger.info(
-        "phase=strategies ticker=%s n=%d elapsed=%.2fs",
+        "phase=strategies ticker=%s n=%d (market=%s) elapsed=%.2fs",
         event.market_ticker,
         len(estimates),
+        "yes" if market_est is not None else "no",
         time.perf_counter() - strat_start,
     )
     for est in estimates:
@@ -344,6 +540,17 @@ def forecast_event(event: EventRequest) -> FinalPrediction:
             est.p_yes,
             est.confidence,
         )
+
+    # Phase 2.25: dynamic confidence scaling when research came up dry.
+    # Bayesian move: lean on the base-rate prior instead of overweighting
+    # an evidence read with nothing under it.
+    if _research_was_weak(research, estimates):
+        logger.info(
+            "phase=rebalance ticker=%s weak_research=true "
+            "(evidence->0.3, base_rate->0.7)",
+            event.market_ticker,
+        )
+        estimates = _rebalance_on_weak_research(estimates)
 
     # Phase 2.5: optional deliberation round — one meta-LLM call adjudicates
     # over the three analysts' estimates and produces a fourth estimate.
@@ -397,6 +604,13 @@ def forecast_event(event: EventRequest) -> FinalPrediction:
         factor,
         time.perf_counter() - ens_start,
     )
+
+    # Phase 4: market anchoring. By default we match the market; only
+    # deviate when our research has genuine edge. This is the dominant
+    # safety net for the (our_brier - market_brier) * completion_rate
+    # scoring formula.
+    final = _market_anchored_prediction(final, estimates, event.market_ticker)
+
     logger.info(
         "phase=total ticker=%s elapsed=%.2fs",
         event.market_ticker,
@@ -462,7 +676,7 @@ def _resolved_shortcut(event: dict[str, Any]) -> dict | None:
     return None
 
 
-def predict(event: dict) -> dict:
+def predict(event: dict, *, _skip_pacing: bool = False) -> dict:
     """CLI-facing prediction function.
 
     Accepts an event dict matching :class:`EventRequest` and returns the
@@ -483,6 +697,10 @@ def predict(event: dict) -> dict:
     Otherwise, after each call this function sleeps for ``PREDICTION_DELAY``
     seconds (default 5, overridable via the ``PREDICTION_DELAY`` env var) so
     that callers iterating over many events stay within provider rate limits.
+
+    The ``_skip_pacing`` kwarg is for internal use by the batch endpoint —
+    sleeping between every item in a 200-event batch would blow the 10-min
+    response window. Leave it ``False`` for normal use.
     """
     ticker = event.get("market_ticker")
 
@@ -529,10 +747,11 @@ def predict(event: dict) -> dict:
     if succeeded and cache_enabled():
         cache_prediction(ticker, result["p_yes"], result["rationale"])
 
-    delay = _prediction_delay_seconds()
-    if delay > 0:
-        logger.info("predict.pacing sleeping=%.1fs", delay)
-        time.sleep(delay)
+    if not _skip_pacing:
+        delay = _prediction_delay_seconds()
+        if delay > 0:
+            logger.info("predict.pacing sleeping=%.1fs", delay)
+            time.sleep(delay)
     return result
 
 
@@ -541,9 +760,337 @@ def predict(event: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 
+def _handle_single_event(event_dict: dict) -> dict:
+    """Run one event through the cached + pacing-free pipeline.
+
+    Used by both ``/predict`` (single-event mode) and ``/predictions`` /
+    ``/predict`` (batch mode). Always returns a ``{p_yes, rationale}`` dict
+    via :func:`predict` with pacing suppressed — the HTTP layer handles
+    request-level pacing implicitly via inter-request gaps.
+    """
+    event_t = event_dict.get("event_ticker") if isinstance(event_dict, dict) else None
+    market_t = (
+        event_dict.get("market_ticker") if isinstance(event_dict, dict) else None
+    )
+    title = (
+        (event_dict.get("title") or "")[:60]
+        if isinstance(event_dict, dict)
+        else ""
+    )
+    logger.info(
+        "endpoint.predict request event_ticker=%s market_ticker=%s title=%r",
+        event_t,
+        market_t,
+        title,
+    )
+    result = predict(event_dict, _skip_pacing=True)
+    logger.info(
+        "endpoint.predict response event_ticker=%s market_ticker=%s p_yes=%.4f",
+        event_t,
+        market_t,
+        result["p_yes"],
+    )
+    return result
+
+
+def _process_predict_body(body: Any) -> Any:
+    """Dispatch a parsed JSON body to single-event or batch processing.
+
+    Auto-detects by type:
+      * ``list`` → process each item, return a list of results
+      * ``dict`` → process one event, return one result
+      * anything else → graceful 0.5 fallback with an explanatory rationale
+    """
+    if isinstance(body, list):
+        logger.info("endpoint.predict batch n=%d", len(body))
+        results: list[dict] = []
+        for i, item in enumerate(body):
+            if not isinstance(item, dict):
+                logger.warning(
+                    "endpoint.predict batch item %d is not a dict, skipping", i
+                )
+                results.append(
+                    {
+                        "p_yes": 0.5,
+                        "rationale": "Item was not a JSON object.",
+                    }
+                )
+                continue
+            results.append(_handle_single_event(item))
+        logger.info("endpoint.predict batch done n=%d", len(results))
+        return results
+
+    if isinstance(body, dict):
+        return _handle_single_event(body)
+
+    logger.warning(
+        "endpoint.predict unexpected body type=%s; defaulting to 0.5",
+        type(body).__name__,
+    )
+    return {
+        "p_yes": 0.5,
+        "rationale": (
+            f"Request body must be a JSON object or array of objects; "
+            f"got {type(body).__name__}."
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# OpenAI-compatible /chat/completions endpoint
+#
+# The Prophet Arena evaluation harness uses ``openai.OpenAI(base_url=…)`` to
+# query agents. We act as the LLM provider: receive a system+user message
+# describing the event/markets/sources, return an OpenAI ``ChatCompletion``
+# response whose ``message.content`` is a JSON string of the form
+# ``{"rationale": "…", "probabilities": {market_a: p, market_b: p, ...}}``.
+# ---------------------------------------------------------------------------
+
+_EVENT_TITLE_PATTERN = re.compile(
+    r'event[s]?\s*[:\s]\s*["“]([^"”]+)["”]', re.IGNORECASE
+)
+_MARKET_LINE_PATTERN = re.compile(r"^\s*[-*]\s+(.+?)\s*$", re.MULTILINE)
+
+_MULTI_MARKET_SYSTEM_PROMPT = """You are a calibrated forecasting analyst.
+You will be given a binary or multi-outcome prediction-market question, a
+list of POSSIBLE OUTCOMES (each is its own YES/NO question), and pre-curated
+research sources.
+
+Your job: produce a probability in ``[0.01, 0.99]`` for EACH outcome,
+representing the likelihood that THAT specific outcome resolves YES. The
+probabilities should sum to approximately 1.0 when the outcomes are
+mutually exclusive (e.g. one team wins) — but do NOT renormalize blindly:
+output your honest per-outcome estimate first.
+
+Calibration discipline:
+- Brier score punishes overconfidence quadratically. Extremes (<0.10 or
+  >0.90) require overwhelming evidence.
+- When evidence is thin or sources are off-topic, stay near a fair prior
+  (uniform across outcomes = ``1/N``).
+- Weight sources by their ranking (lower rank = higher priority).
+- Respect the EXACT outcome names from the question — case-sensitive — and
+  give a probability for EVERY outcome listed. Missing or extra outcome
+  names will be rejected by the harness.
+
+Respond with ONLY a JSON object:
+{
+  "rationale": "<2-3 sentence justification grounded in the sources>",
+  "probabilities": {
+    "<outcome name 1>": <float 0.01-0.99>,
+    "<outcome name 2>": <float 0.01-0.99>,
+    ...
+  }
+}
+
+No prose, no markdown fences, no commentary."""
+
+
+def _parse_chat_request(messages: list[dict]) -> dict:
+    """Pull event title, markets, and source text out of OpenAI-format messages.
+
+    Returns a dict with keys ``title`` (str), ``markets`` (list[str]),
+    ``system`` (concatenated system content), and ``user`` (concatenated
+    user content). Best-effort: if the prompt format is unfamiliar, the
+    fields come back empty and the caller falls back to a safe default.
+    """
+    system_parts: list[str] = []
+    user_parts: list[str] = []
+    for msg in messages or []:
+        if not isinstance(msg, dict):
+            continue
+        role = (msg.get("role") or "").strip().lower()
+        content = msg.get("content")
+        if not isinstance(content, str):
+            continue
+        if role == "system":
+            system_parts.append(content)
+        elif role == "user":
+            user_parts.append(content)
+
+    system_text = "\n".join(system_parts).strip()
+    user_text = "\n".join(user_parts).strip()
+
+    title_match = _EVENT_TITLE_PATTERN.search(system_text)
+    title = title_match.group(1).strip() if title_match else ""
+
+    # Markets appear as a bulleted list right after "possible outcomes:" /
+    # "following possible outcomes:" / etc. We just collect every "- foo"
+    # line in the system content (the predictor prompt has no other lists).
+    markets: list[str] = []
+    for m in _MARKET_LINE_PATTERN.finditer(system_text):
+        candidate = m.group(1).strip()
+        # Skip lines that look like instruction bullets ("MUST", "Do NOT", etc.).
+        if (
+            candidate
+            and not candidate.lower().startswith(("must", "do ", "ensure", "use "))
+            and len(candidate) < 200
+        ):
+            markets.append(candidate)
+
+    return {
+        "title": title,
+        "markets": markets,
+        "system": system_text,
+        "user": user_text,
+    }
+
+
+def _normalize_probabilities(
+    probabilities: dict[str, float], markets: list[str]
+) -> dict[str, float]:
+    """Clamp each probability to ``[0.01, 0.99]`` and snap unknowns to ``1/N``.
+
+    The harness rejects missing/extra market names, so we always return a
+    probability for every market in ``markets`` and nothing else.
+    """
+    out: dict[str, float] = {}
+    n = max(1, len(markets))
+    default = 1.0 / n
+    for m in markets:
+        raw = probabilities.get(m, default)
+        try:
+            v = float(raw)
+        except (TypeError, ValueError):
+            v = default
+        out[m] = max(P_MIN, min(P_MAX, v))
+    return out
+
+
+def _predict_multi_outcome(
+    title: str, markets: list[str], research: str
+) -> dict[str, Any]:
+    """Single LLM call that returns a probability per market.
+
+    Used by the OpenAI-compatible endpoint for events with more than two
+    outcomes — running the full binary ensemble N times for an event with
+    20 markets would blow the 10-minute response window. The prompt mirrors
+    the standalone-predictor format so we always emit valid output for
+    multi-outcome events.
+    """
+    market_lines = "\n".join(f"- {m}" for m in markets)
+    user_prompt = (
+        f"Question: {title}\n\n"
+        f"POSSIBLE OUTCOMES (must give probability for each by EXACT name):\n"
+        f"{market_lines}\n\n"
+        f"Research / sources:\n{(research or '(none provided)')[:6000]}\n\n"
+        f"Return the JSON object only."
+    )
+
+    try:
+        data = call_llm_json(
+            _MULTI_MARKET_SYSTEM_PROMPT,
+            user_prompt,
+            tier="reasoning",
+            temperature=0.2,
+            max_tokens=900,
+        )
+    except Exception as exc:  # noqa: BLE001 — never break the harness
+        logger.warning("multi-outcome LLM call failed: %s", exc)
+        # Uniform fallback so every market still has a value.
+        uniform = 1.0 / max(1, len(markets))
+        return {
+            "rationale": f"Multi-outcome LLM call failed ({exc}); defaulting to uniform {uniform:.3f}.",
+            "probabilities": dict.fromkeys(markets, uniform),
+        }
+
+    rationale = str(data.get("rationale", "")).strip() or "(no rationale)"
+    raw_probs = data.get("probabilities")
+    if not isinstance(raw_probs, dict):
+        raw_probs = {}
+    return {
+        "rationale": rationale,
+        "probabilities": _normalize_probabilities(raw_probs, markets),
+    }
+
+
+def _handle_chat_completion(body: dict) -> dict:
+    """Run our pipeline for an OpenAI-format request and emit an OpenAI response.
+
+    Routing:
+        * 2-market (binary) event → reuse our full ensemble pipeline via
+          ``predict()``. Probabilities for the two sides are
+          ``(p_yes, 1 - p_yes)``.
+        * 3+ markets → single multi-outcome LLM call (``_predict_multi_outcome``)
+          to fit inside the 10-min response budget.
+        * Title or markets couldn't be parsed → safe uniform fallback.
+    """
+    model = (body.get("model") if isinstance(body, dict) else None) or "ensemble-agent"
+    messages = body.get("messages") if isinstance(body, dict) else None
+    if not isinstance(messages, list):
+        messages = []
+
+    parsed = _parse_chat_request(messages)
+    title = parsed["title"]
+    markets = parsed["markets"]
+    research = parsed["user"]  # the user prompt is the curated source bundle
+
+    logger.info(
+        "endpoint.chat request model=%s title=%r markets=%d",
+        model,
+        title[:60],
+        len(markets),
+    )
+
+    if not markets:
+        logger.warning("endpoint.chat could not parse markets from messages")
+        content = {
+            "rationale": "Could not parse markets from the request prompt.",
+            "probabilities": {},
+        }
+    elif len(markets) == 2:
+        # Binary event — run the full ensemble pipeline.
+        event_dict = {
+            "title": title or "(untitled event)",
+            "outcomes": markets,
+            "category": "Other",
+            "rules": None,
+            "close_time": None,
+            "description": research[:500] if research else None,
+        }
+        result = predict(event_dict, _skip_pacing=True)
+        p_yes = float(result["p_yes"])
+        content = {
+            "rationale": result["rationale"][:1500],
+            "probabilities": _normalize_probabilities(
+                {markets[0]: p_yes, markets[1]: 1.0 - p_yes}, markets
+            ),
+        }
+    else:
+        content = _predict_multi_outcome(title, markets, research)
+
+    logger.info(
+        "endpoint.chat response model=%s markets=%d probabilities=%s",
+        model,
+        len(markets),
+        {k: round(v, 3) for k, v in content.get("probabilities", {}).items()},
+    )
+
+    return {
+        "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": json.dumps(content),
+                },
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        },
+    }
+
+
 def _build_app() -> Any:
     """Lazily construct the FastAPI app so importing this module is cheap."""
-    from fastapi import FastAPI
+    from fastapi import Body, FastAPI
 
     fastapi_app = FastAPI(title="Ensemble Forecast Agent")
 
@@ -552,15 +1099,31 @@ def _build_app() -> Any:
         """Liveness probe for Railway / load-balancer health checks."""
         return {"status": "ok", "service": "ensemble-forecast-agent"}
 
-    @fastapi_app.post("/predict", response_model=PredictionResponse)
-    async def predict_endpoint(event: EventRequest) -> PredictionResponse:
-        logger.info(
-            "endpoint.predict ticker=%s title=%s",
-            event.market_ticker,
-            event.title,
-        )
-        final = forecast_event(event)
-        return PredictionResponse(p_yes=final.p_yes, rationale=final.rationale)
+    # /predict — accepts either a single event dict or a list of event dicts.
+    # Using ``Body(...)`` with ``Any`` so FastAPI doesn't try to validate
+    # the body against a fixed Pydantic schema (which would reject the
+    # alternate format with 422).
+    @fastapi_app.post("/predict")
+    async def predict_endpoint(body: Any = Body(...)):  # noqa: B008 — FastAPI idiom
+        return _process_predict_body(body)
+
+    # /predictions — alias so eval harnesses that expect the plural path
+    # work identically (single + batch).
+    @fastapi_app.post("/predictions")
+    async def predictions_endpoint(body: Any = Body(...)):  # noqa: B008
+        return _process_predict_body(body)
+
+    # /v1/chat/completions — the OpenAI-compatible endpoint the Prophet
+    # Arena evaluation harness will hit. Both the v1-prefixed and
+    # unprefixed paths are registered so the harness works regardless of
+    # whether their ``base_url`` ends in ``/v1``.
+    @fastapi_app.post("/v1/chat/completions")
+    async def chat_completions_v1(body: dict = Body(...)):  # noqa: B008
+        return _handle_chat_completion(body)
+
+    @fastapi_app.post("/chat/completions")
+    async def chat_completions(body: dict = Body(...)):  # noqa: B008
+        return _handle_chat_completion(body)
 
     return fastapi_app
 
@@ -576,8 +1139,18 @@ def main() -> None:
         1. ``PORT`` — set by Railway and most PaaS providers.
         2. ``ENSEMBLE_PORT`` — local override for dev.
         3. Fallback ``8000``.
+
+    Also configures the root logger at INFO with timestamps so per-request
+    log lines (``endpoint.predict request|response …``) show up in Railway
+    logs without extra setup. Uvicorn's own loggers are left alone — they
+    add their own formatter.
     """
     import uvicorn
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
 
     host = os.environ.get("ENSEMBLE_HOST", "0.0.0.0")
     port = int(os.environ.get("PORT", os.environ.get("ENSEMBLE_PORT", "8000")))

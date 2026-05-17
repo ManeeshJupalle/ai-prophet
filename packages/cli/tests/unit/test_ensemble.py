@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 
 import pytest
@@ -1099,6 +1100,526 @@ def test_health_endpoint_returns_ok() -> None:
     body = response.json()
     assert body["status"] == "ok"
     assert body["service"] == "ensemble-forecast-agent"
+
+
+def _stub_pipeline(monkeypatch, tmp_path, p_yes: float = 0.6234) -> None:
+    """Common setup for FastAPI endpoint tests: isolate cache + stub the pipeline."""
+    from ai_prophet.forecast import ensemble_agent
+    from ai_prophet.forecast.ensemble import FinalPrediction
+
+    monkeypatch.setenv("PREDICTION_CACHE_PATH", str(tmp_path / "cache.json"))
+    monkeypatch.setenv("ENABLE_CACHE", "true")
+    monkeypatch.setenv("PREDICTION_DELAY", "0")
+
+    fake_final = FinalPrediction(
+        p_yes=p_yes,
+        rationale="r",
+        raw_p_yes=p_yes,
+        agreement=1.0,
+        shrinkage=0.05,
+        estimates=[Estimate(p_yes=p_yes, rationale="r", strategy="s", confidence=0.7)],
+    )
+    monkeypatch.setattr(ensemble_agent, "forecast_event", lambda _e: fake_final)
+
+
+def test_predict_endpoint_logs_request_and_response(
+    caplog, monkeypatch, tmp_path
+) -> None:
+    """POST /predict writes a request-entry and a response-exit log line."""
+    import logging
+
+    from ai_prophet.forecast import ensemble_agent
+    from fastapi.testclient import TestClient
+
+    _stub_pipeline(monkeypatch, tmp_path, p_yes=0.6234)
+
+    client = TestClient(ensemble_agent.app)
+    caplog.set_level(logging.INFO, logger="ai_prophet.forecast.ensemble_agent")
+
+    long_title = (
+        "Will Cleveland beat Detroit in NBA Eastern Conference Game 6 on May 15, 2026?"
+    )
+    resp = client.post(
+        "/predict",
+        json={
+            "event_ticker": "EVT-1",
+            "market_ticker": "MKT-1",
+            "title": long_title,
+            "category": "Sports",
+            "close_time": "2026-05-31T23:59:59Z",
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["p_yes"] == pytest.approx(0.6234)
+
+    endpoint_msgs = [
+        r.message for r in caplog.records if "endpoint.predict" in r.message
+    ]
+    request_lines = [m for m in endpoint_msgs if "request" in m]
+    response_lines = [m for m in endpoint_msgs if "response" in m]
+    assert request_lines, "missing endpoint.predict request log"
+    assert response_lines, "missing endpoint.predict response log"
+
+    req = request_lines[-1]
+    assert "event_ticker=EVT-1" in req
+    assert "market_ticker=MKT-1" in req
+    # The title in the log is truncated to 60 chars.
+    assert long_title[:60] in req
+    assert long_title not in req  # full string wasn't logged
+
+    rsp = response_lines[-1]
+    assert "event_ticker=EVT-1" in rsp
+    assert "market_ticker=MKT-1" in rsp
+    assert "p_yes=0.6234" in rsp
+
+
+# ---------------------------------------------------------------------------
+# /predict — batch mode + /predictions alias
+# ---------------------------------------------------------------------------
+
+
+def test_predict_accepts_list_and_returns_list(monkeypatch, tmp_path) -> None:
+    """POST /predict with a JSON list returns a list of predictions."""
+    from ai_prophet.forecast import ensemble_agent
+    from fastapi.testclient import TestClient
+
+    _stub_pipeline(monkeypatch, tmp_path, p_yes=0.55)
+
+    client = TestClient(ensemble_agent.app)
+    payload = [
+        {
+            "event_ticker": "E1",
+            "market_ticker": "M1",
+            "title": "Event one?",
+            "category": "Sports",
+            "close_time": "2026-06-01T00:00:00Z",
+        },
+        {
+            "event_ticker": "E2",
+            "market_ticker": "M2",
+            "title": "Event two?",
+            "category": "Crypto",
+            "close_time": "2026-06-01T00:00:00Z",
+        },
+    ]
+    resp = client.post("/predict", json=payload)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert isinstance(body, list)
+    assert len(body) == 2
+    for item in body:
+        assert set(item.keys()) >= {"p_yes", "rationale"}
+        assert item["p_yes"] == pytest.approx(0.55)
+
+
+def test_predict_single_dict_still_returns_dict(monkeypatch, tmp_path) -> None:
+    """Backward-compat: a single dict body returns a single dict."""
+    from ai_prophet.forecast import ensemble_agent
+    from fastapi.testclient import TestClient
+
+    _stub_pipeline(monkeypatch, tmp_path, p_yes=0.42)
+
+    client = TestClient(ensemble_agent.app)
+    resp = client.post(
+        "/predict",
+        json={
+            "event_ticker": "E",
+            "market_ticker": "M",
+            "title": "One event?",
+            "category": "Sports",
+            "close_time": "2026-06-01T00:00:00Z",
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert isinstance(body, dict)
+    assert body["p_yes"] == pytest.approx(0.42)
+
+
+def test_predictions_endpoint_aliases_predict(monkeypatch, tmp_path) -> None:
+    """/predictions behaves identically to /predict in both modes."""
+    from ai_prophet.forecast import ensemble_agent
+    from fastapi.testclient import TestClient
+
+    _stub_pipeline(monkeypatch, tmp_path, p_yes=0.31)
+
+    client = TestClient(ensemble_agent.app)
+
+    # Single mode
+    single_resp = client.post(
+        "/predictions",
+        json={"event_ticker": "E", "market_ticker": "M", "title": "x"},
+    )
+    assert single_resp.status_code == 200
+    assert single_resp.json()["p_yes"] == pytest.approx(0.31)
+    assert isinstance(single_resp.json(), dict)
+
+    # Batch mode
+    batch_resp = client.post(
+        "/predictions",
+        json=[
+            {"event_ticker": "E1", "market_ticker": "M1", "title": "a"},
+            {"event_ticker": "E2", "market_ticker": "M2", "title": "b"},
+        ],
+    )
+    assert batch_resp.status_code == 200
+    body = batch_resp.json()
+    assert isinstance(body, list)
+    assert len(body) == 2
+
+
+def test_predict_batch_with_empty_list_returns_empty_list(
+    monkeypatch, tmp_path
+) -> None:
+    from ai_prophet.forecast import ensemble_agent
+    from fastapi.testclient import TestClient
+
+    _stub_pipeline(monkeypatch, tmp_path)
+
+    client = TestClient(ensemble_agent.app)
+    resp = client.post("/predict", json=[])
+    assert resp.status_code == 200
+    assert resp.json() == []
+
+
+def test_predict_batch_skips_non_dict_items_gracefully(
+    monkeypatch, tmp_path
+) -> None:
+    """If an item in the batch isn't a JSON object, return 0.5 for that slot."""
+    from ai_prophet.forecast import ensemble_agent
+    from fastapi.testclient import TestClient
+
+    _stub_pipeline(monkeypatch, tmp_path, p_yes=0.71)
+
+    client = TestClient(ensemble_agent.app)
+    payload = [
+        {"event_ticker": "E1", "market_ticker": "M1", "title": "valid"},
+        "not-a-dict",  # malformed
+        {"event_ticker": "E2", "market_ticker": "M2", "title": "valid2"},
+    ]
+    resp = client.post("/predict", json=payload)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert len(body) == 3
+    assert body[0]["p_yes"] == pytest.approx(0.71)
+    assert body[1]["p_yes"] == 0.5  # graceful fallback for the bad item
+    assert "JSON object" in body[1]["rationale"]
+    assert body[2]["p_yes"] == pytest.approx(0.71)
+
+
+def test_predict_returns_graceful_fallback_for_top_level_non_object(
+    monkeypatch, tmp_path
+) -> None:
+    """A bare number or string body returns a single 0.5 prediction."""
+    from ai_prophet.forecast import ensemble_agent
+    from fastapi.testclient import TestClient
+
+    _stub_pipeline(monkeypatch, tmp_path)
+
+    client = TestClient(ensemble_agent.app)
+    resp = client.post("/predict", json=42)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["p_yes"] == 0.5
+    assert "object or array" in body["rationale"]
+
+
+# ---------------------------------------------------------------------------
+# /v1/chat/completions — OpenAI-compatible endpoint for the eval harness
+# ---------------------------------------------------------------------------
+
+
+_REFERENCE_SYSTEM_PROMPT = """You are an AI assistant specialized in analyzing
+and predicting real-world events. You have deep expertise in predicting the
+outcome of the event: "Indiana vs Memphis"
+
+Note that this event occurs in the future. You will be given a list of sources
+with their summaries, rankings, and expert comments. Based on these collected
+sources, your goal is to extract meaningful insights and provide well-reasoned
+predictions based on the given data.
+You will be predicting the probability (as a float value from 0 to 1) of ONLY
+the following possible outcomes:
+- Memphis
+- Indiana
+
+IMPORTANT CONSTRAINTS:
+1. You MUST ONLY provide probabilities for the exact possible outcomes listed above
+2. Do NOT create or invent any additional outcomes
+3. Use exactly the same outcome names as provided (case-sensitive)
+4. Ensure all probabilities are between 0 and 1
+"""
+
+_REFERENCE_USER_PROMPT = "HERE IS THE GIVEN DATA: Source 1: Pacers beat Grizzlies 124-103 last meeting..."
+
+
+def _stub_chat_pipeline(monkeypatch, tmp_path, p_yes: float = 0.55) -> None:
+    """Shared setup: isolate cache + stub the full ensemble pipeline."""
+    from ai_prophet.forecast import ensemble_agent
+    from ai_prophet.forecast.ensemble import FinalPrediction
+
+    monkeypatch.setenv("PREDICTION_CACHE_PATH", str(tmp_path / "cache.json"))
+    monkeypatch.setenv("ENABLE_CACHE", "true")
+    monkeypatch.setenv("PREDICTION_DELAY", "0")
+
+    fake_final = FinalPrediction(
+        p_yes=p_yes,
+        rationale="stub rationale",
+        raw_p_yes=p_yes,
+        agreement=1.0,
+        shrinkage=0.05,
+        estimates=[Estimate(p_yes=p_yes, rationale="r", strategy="s", confidence=0.7)],
+    )
+    monkeypatch.setattr(ensemble_agent, "forecast_event", lambda _e: fake_final)
+
+
+def test_parse_chat_request_extracts_title_and_markets() -> None:
+    """The reference system-prompt format parses correctly."""
+    from ai_prophet.forecast.ensemble_agent import _parse_chat_request
+
+    parsed = _parse_chat_request(
+        [
+            {"role": "system", "content": _REFERENCE_SYSTEM_PROMPT},
+            {"role": "user", "content": _REFERENCE_USER_PROMPT},
+        ]
+    )
+    assert parsed["title"] == "Indiana vs Memphis"
+    assert parsed["markets"] == ["Memphis", "Indiana"]
+    assert "Source 1" in parsed["user"]
+
+
+def test_parse_chat_request_handles_empty_messages() -> None:
+    from ai_prophet.forecast.ensemble_agent import _parse_chat_request
+
+    parsed = _parse_chat_request([])
+    assert parsed["title"] == ""
+    assert parsed["markets"] == []
+
+
+def test_chat_completions_v1_binary_event(monkeypatch, tmp_path) -> None:
+    """Two-outcome event: run through ensemble, split probabilities."""
+    from ai_prophet.forecast import ensemble_agent
+    from fastapi.testclient import TestClient
+
+    _stub_chat_pipeline(monkeypatch, tmp_path, p_yes=0.72)
+
+    client = TestClient(ensemble_agent.app)
+    resp = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "ensemble-agent",
+            "messages": [
+                {"role": "system", "content": _REFERENCE_SYSTEM_PROMPT},
+                {"role": "user", "content": _REFERENCE_USER_PROMPT},
+            ],
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+
+    # OpenAI ChatCompletion shape.
+    assert body["object"] == "chat.completion"
+    assert body["model"] == "ensemble-agent"
+    assert "id" in body
+    assert "created" in body
+    assert len(body["choices"]) == 1
+    assert body["choices"][0]["message"]["role"] == "assistant"
+
+    # The message content is a JSON string with rationale + probabilities.
+    content = json.loads(body["choices"][0]["message"]["content"])
+    assert "rationale" in content
+    assert set(content["probabilities"].keys()) == {"Memphis", "Indiana"}
+    # Memphis is outcomes[0] → gets the ensemble's p_yes; Indiana gets 1-p_yes.
+    assert content["probabilities"]["Memphis"] == pytest.approx(0.72)
+    assert content["probabilities"]["Indiana"] == pytest.approx(0.28)
+
+
+def test_chat_completions_path_alias_without_v1_prefix(monkeypatch, tmp_path) -> None:
+    """``/chat/completions`` is registered as well as ``/v1/chat/completions``."""
+    from ai_prophet.forecast import ensemble_agent
+    from fastapi.testclient import TestClient
+
+    _stub_chat_pipeline(monkeypatch, tmp_path, p_yes=0.42)
+
+    client = TestClient(ensemble_agent.app)
+    resp = client.post(
+        "/chat/completions",
+        json={
+            "model": "x",
+            "messages": [
+                {"role": "system", "content": _REFERENCE_SYSTEM_PROMPT},
+                {"role": "user", "content": ""},
+            ],
+        },
+    )
+    assert resp.status_code == 200
+    content = json.loads(resp.json()["choices"][0]["message"]["content"])
+    assert content["probabilities"]["Memphis"] == pytest.approx(0.42)
+
+
+def test_chat_completions_multi_outcome_routes_to_dedicated_handler(
+    monkeypatch, tmp_path
+) -> None:
+    """3+ markets go through ``_predict_multi_outcome`` instead of the ensemble."""
+    from ai_prophet.forecast import ensemble_agent
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setenv("ENABLE_CACHE", "false")
+
+    # The multi-outcome path calls ``call_llm_json`` directly via
+    # ``_predict_multi_outcome``. Patch that function instead, so we don't
+    # need to drive the LLM mock through the call_llm chain.
+    def fake_multi(title, markets, research):
+        n = len(markets)
+        return {
+            "rationale": f"multi-outcome stub for {n} markets",
+            "probabilities": dict.fromkeys(markets, 1.0 / n),
+        }
+
+    monkeypatch.setattr(ensemble_agent, "_predict_multi_outcome", fake_multi)
+
+    multi_system = """You will predict outcomes for: "RWA on Avalanche"
+You will be predicting the probability of ONLY the following possible outcomes:
+- Above $450
+- Above $500
+- Above $600
+- Above $700
+"""
+    client = TestClient(ensemble_agent.app)
+    resp = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "ensemble",
+            "messages": [
+                {"role": "system", "content": multi_system},
+                {"role": "user", "content": "sources..."},
+            ],
+        },
+    )
+    assert resp.status_code == 200
+    content = json.loads(resp.json()["choices"][0]["message"]["content"])
+    assert set(content["probabilities"].keys()) == {
+        "Above $450",
+        "Above $500",
+        "Above $600",
+        "Above $700",
+    }
+    # All four markets get the uniform probability from our stub.
+    for p in content["probabilities"].values():
+        assert p == pytest.approx(0.25)
+
+
+def test_chat_completions_unparseable_prompt_returns_safe_payload(
+    monkeypatch, tmp_path
+) -> None:
+    """If we can't parse markets, return a valid (if empty) OpenAI response."""
+    from ai_prophet.forecast import ensemble_agent
+    from fastapi.testclient import TestClient
+
+    _stub_chat_pipeline(monkeypatch, tmp_path)
+
+    client = TestClient(ensemble_agent.app)
+    resp = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "ensemble",
+            "messages": [
+                {"role": "system", "content": "Plain text, no event header, no bullets."},
+            ],
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["object"] == "chat.completion"
+    content = json.loads(body["choices"][0]["message"]["content"])
+    # No markets parsed → empty probabilities dict, but the response itself
+    # is structurally valid.
+    assert content["probabilities"] == {}
+    assert "Could not parse" in content["rationale"]
+
+
+def test_normalize_probabilities_clamps_and_fills() -> None:
+    """Missing markets get 1/N; values are clamped to [0.01, 0.99]."""
+    from ai_prophet.forecast.ensemble_agent import _normalize_probabilities
+
+    markets = ["A", "B", "C"]
+    out = _normalize_probabilities({"A": 1.5, "B": -0.3}, markets)
+    assert out["A"] == 0.99  # clamped
+    assert out["B"] == 0.01  # clamped
+    assert out["C"] == pytest.approx(1.0 / 3)  # default for missing
+    assert set(out.keys()) == {"A", "B", "C"}  # no extras
+
+
+def test_chat_completions_response_has_openai_shape(monkeypatch, tmp_path) -> None:
+    """Every required ChatCompletion field is present."""
+    from ai_prophet.forecast import ensemble_agent
+    from fastapi.testclient import TestClient
+
+    _stub_chat_pipeline(monkeypatch, tmp_path, p_yes=0.5)
+
+    client = TestClient(ensemble_agent.app)
+    resp = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "ensemble-agent",
+            "messages": [
+                {"role": "system", "content": _REFERENCE_SYSTEM_PROMPT},
+                {"role": "user", "content": "sources"},
+            ],
+        },
+    )
+    body = resp.json()
+    for key in ("id", "object", "created", "model", "choices", "usage"):
+        assert key in body, f"missing top-level key: {key}"
+    assert body["id"].startswith("chatcmpl-")
+    choice = body["choices"][0]
+    for key in ("index", "message", "finish_reason"):
+        assert key in choice
+    for key in ("role", "content"):
+        assert key in choice["message"]
+
+
+# ---------------------------------------------------------------------------
+# Returns to the existing tests
+# ---------------------------------------------------------------------------
+
+
+def test_predict_batch_logs_one_request_response_pair_per_item(
+    caplog, monkeypatch, tmp_path
+) -> None:
+    """Every item in a batch produces its own request + response log line."""
+    import logging
+
+    from ai_prophet.forecast import ensemble_agent
+    from fastapi.testclient import TestClient
+
+    _stub_pipeline(monkeypatch, tmp_path, p_yes=0.5)
+
+    client = TestClient(ensemble_agent.app)
+    caplog.set_level(logging.INFO, logger="ai_prophet.forecast.ensemble_agent")
+
+    payload = [
+        {"event_ticker": "A", "market_ticker": "MA", "title": "alpha"},
+        {"event_ticker": "B", "market_ticker": "MB", "title": "beta"},
+        {"event_ticker": "C", "market_ticker": "MC", "title": "gamma"},
+    ]
+    resp = client.post("/predict", json=payload)
+    assert resp.status_code == 200
+
+    request_lines = [
+        r.message
+        for r in caplog.records
+        if "endpoint.predict request" in r.message
+    ]
+    response_lines = [
+        r.message
+        for r in caplog.records
+        if "endpoint.predict response" in r.message
+    ]
+    assert len(request_lines) == 3
+    assert len(response_lines) == 3
+    # Each event_ticker shows up in exactly one request line.
+    for tk in ("A", "B", "C"):
+        assert sum(f"event_ticker={tk}" in m for m in request_lines) == 1
 
 
 def test_forecast_event_threads_temporal_context_to_strategies(

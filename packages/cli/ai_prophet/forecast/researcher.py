@@ -119,6 +119,14 @@ CATEGORY_HINTS: dict[str, str] = {
         "Search for official weather forecasts, historical climate data, "
         "and meteorological service predictions."
     ),
+    "Mentions": (
+        "Search for recent public statements, speeches, press conferences, "
+        "social media posts, and media appearances by the person mentioned."
+    ),
+    "Other": (
+        "Search for recent news, official announcements, regulatory filings, "
+        "and expert analysis related to the topic."
+    ),
 }
 
 DEFAULT_CATEGORY_HINT = (
