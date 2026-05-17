@@ -46,7 +46,8 @@ Calibration discipline:
 - If you cannot identify a defensible reference class, your confidence is low.
 
 Confidence (0.1-1.0) tracks how well-defined the reference class is and how
-much the specific evidence agrees with it.
+much the specific evidence agrees with it. Your confidence should rarely
+exceed 0.6 — you are providing a cross-check, not the primary analysis.
 
 Respond with ONLY a JSON object:
 {"p_yes": <float 0.01-0.99>, "confidence": <float 0.1-1.0>,

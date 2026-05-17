@@ -369,6 +369,21 @@ def forecast_event(event: EventRequest) -> FinalPrediction:
     else:
         logger.debug("phase=deliberation disabled via ENABLE_DELIBERATION")
 
+    # Diagnostic: show the relative weight each estimate carries into the
+    # ensemble (confidence / sum of confidences). Useful for verifying
+    # rebalanced strategy confidence is doing what we expect — e.g. the
+    # evidence_weighted analyst should typically dominate when the research
+    # is strong.
+    _total_conf = sum(e.confidence for e in estimates) or 1.0
+    weight_parts = " ".join(
+        f"{e.strategy}={e.confidence / _total_conf:.3f}" for e in estimates
+    )
+    logger.info(
+        "phase=weights ticker=%s %s",
+        event.market_ticker,
+        weight_parts,
+    )
+
     # Phase 3: ensemble + calibration (temporal-aware shrinkage)
     ens_start = time.perf_counter()
     final = ensemble_predict(estimates, temporal_factor=factor)

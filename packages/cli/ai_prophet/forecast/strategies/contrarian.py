@@ -50,7 +50,9 @@ Calibration discipline:
 
 Confidence (0.1-1.0) reflects how strongly the stress test points to a
 specific number. Low confidence is appropriate when you find genuine flaws
-in the consensus but cannot say which direction they push.
+in the consensus but cannot say which direction they push. Your confidence
+should rarely exceed 0.6 — you are providing a cross-check, not the
+primary analysis.
 
 Respond with ONLY a JSON object:
 {"p_yes": <float 0.01-0.99>, "confidence": <float 0.1-1.0>,
