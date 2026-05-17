@@ -764,9 +764,16 @@ def _handle_single_event(event_dict: dict) -> dict:
     """Run one event through the cached + pacing-free pipeline.
 
     Used by both ``/predict`` (single-event mode) and ``/predictions`` /
-    ``/predict`` (batch mode). Always returns a ``{p_yes, rationale}`` dict
-    via :func:`predict` with pacing suppressed — the HTTP layer handles
-    request-level pacing implicitly via inter-request gaps.
+    ``/predict`` (batch mode). Routing by ``outcomes`` length:
+
+    * 2 outcomes (binary) → existing :func:`predict` path, returns
+      ``{p_yes, rationale}``.
+    * 3+ outcomes (multi) → :func:`_handle_multi_outcome_event`, returns
+      ``{probabilities: [{market, probability}, ...], rationale}`` — the
+      distribution shape the forecasting harness expects.
+
+    Pacing is suppressed; the HTTP layer handles request-level spacing
+    implicitly via inter-request gaps.
     """
     event_t = event_dict.get("event_ticker") if isinstance(event_dict, dict) else None
     market_t = (
@@ -777,6 +784,29 @@ def _handle_single_event(event_dict: dict) -> dict:
         if isinstance(event_dict, dict)
         else ""
     )
+    outcomes = (
+        event_dict.get("outcomes") if isinstance(event_dict, dict) else None
+    ) or []
+
+    if isinstance(outcomes, list) and len(outcomes) > 2:
+        logger.info(
+            "endpoint.predict request event_ticker=%s market_ticker=%s "
+            "title=%r outcomes=%d (multi)",
+            event_t,
+            market_t,
+            title,
+            len(outcomes),
+        )
+        result = _handle_multi_outcome_event(event_dict, outcomes)
+        logger.info(
+            "endpoint.predict response event_ticker=%s market_ticker=%s "
+            "probabilities=%d",
+            event_t,
+            market_t,
+            len(result.get("probabilities", [])),
+        )
+        return result
+
     logger.info(
         "endpoint.predict request event_ticker=%s market_ticker=%s title=%r",
         event_t,
@@ -791,6 +821,55 @@ def _handle_single_event(event_dict: dict) -> dict:
         result["p_yes"],
     )
     return result
+
+
+def _handle_multi_outcome_event(event_dict: dict, outcomes: list[str]) -> dict:
+    """Run a 3+ outcome event through a single multi-outcome LLM call.
+
+    Returns ``{probabilities: [{market, probability}, ...], rationale}`` —
+    the array shape the forecasting harness expects for distribution
+    responses. Research is gathered first so the LLM has sources to ground
+    on; any failure falls back to a uniform distribution.
+
+    The per-market probabilities are clamped to ``[P_MIN, P_MAX]`` inside
+    :func:`_predict_multi_outcome`, then sum-normalized here so the array
+    is a valid probability distribution.
+    """
+    title = str(event_dict.get("title") or "(untitled event)")
+    description = event_dict.get("description")
+    category = event_dict.get("category")
+    rules = event_dict.get("rules")
+
+    try:
+        research = research_event(
+            title=title,
+            description=description,
+            category=category,
+            rules=rules,
+        )
+    except Exception as exc:  # noqa: BLE001 — never crash the endpoint
+        logger.warning("multi-outcome research failed: %s", exc)
+        research = ""
+
+    content = _predict_multi_outcome(title, outcomes, research)
+    probs_dict = content.get("probabilities") or {}
+    n = max(1, len(outcomes))
+    default = 1.0 / n
+    probs_array = [
+        {
+            "market": str(m),
+            "probability": float(probs_dict.get(m, default)),
+        }
+        for m in outcomes
+    ]
+    total = sum(p["probability"] for p in probs_array)
+    if total > 0:
+        for p in probs_array:
+            p["probability"] = p["probability"] / total
+    return {
+        "probabilities": probs_array,
+        "rationale": str(content.get("rationale") or "")[:1500],
+    }
 
 
 def _process_predict_body(body: Any) -> Any:

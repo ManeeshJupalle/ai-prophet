@@ -1236,6 +1236,104 @@ def test_predict_single_dict_still_returns_dict(monkeypatch, tmp_path) -> None:
     assert body["p_yes"] == pytest.approx(0.42)
 
 
+def test_predict_multi_outcome_returns_probabilities_array(
+    monkeypatch, tmp_path
+) -> None:
+    """3+ outcome events return {probabilities: [{market, probability}], rationale}.
+
+    The forecasting harness rejects responses missing a ``probabilities``
+    array on distribution events, so the /predict route must emit the
+    array shape (not a dict) and include every market the event listed.
+    """
+    from ai_prophet.forecast import ensemble_agent
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setenv("PREDICTION_CACHE_PATH", str(tmp_path / "cache.json"))
+    monkeypatch.setenv("ENABLE_CACHE", "false")
+
+    # Skip the network: stub research and the multi-outcome LLM call.
+    monkeypatch.setattr(
+        ensemble_agent, "research_event", lambda **_kw: "(stubbed research)"
+    )
+    monkeypatch.setattr(
+        ensemble_agent,
+        "_predict_multi_outcome",
+        lambda title, markets, research: {
+            "rationale": "stub rationale",
+            "probabilities": {
+                "Boston Celtics": 0.40,
+                "Denver Nuggets": 0.25,
+                "Minnesota Timberwolves": 0.20,
+                "Indiana Pacers": 0.15,
+            },
+        },
+    )
+
+    client = TestClient(ensemble_agent.app)
+    outcomes = [
+        "Boston Celtics",
+        "Denver Nuggets",
+        "Minnesota Timberwolves",
+        "Indiana Pacers",
+    ]
+    resp = client.post(
+        "/predict",
+        json={
+            "event_ticker": "NBA-2026",
+            "market_ticker": "NBA-CHAMP-2026",
+            "title": "Who will win the 2026 NBA championship?",
+            "category": "Sports",
+            "close_time": "2026-06-30T00:00:00Z",
+            "outcomes": outcomes,
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+
+    # Shape: distribution response, not binary.
+    assert "probabilities" in body
+    assert "p_yes" not in body
+    probs = body["probabilities"]
+    assert isinstance(probs, list)
+    assert len(probs) == 4
+
+    # Every market present, with the right keys.
+    returned_markets = {p["market"] for p in probs}
+    assert returned_markets == set(outcomes)
+    for p in probs:
+        assert set(p.keys()) == {"market", "probability"}
+        assert 0.0 <= p["probability"] <= 1.0
+
+    # Sum-normalized to a valid distribution.
+    total = sum(p["probability"] for p in probs)
+    assert total == pytest.approx(1.0, abs=1e-6)
+
+
+def test_predict_two_outcomes_still_returns_p_yes(monkeypatch, tmp_path) -> None:
+    """Binary (2-outcome) events keep returning the legacy {p_yes, rationale} shape."""
+    from ai_prophet.forecast import ensemble_agent
+    from fastapi.testclient import TestClient
+
+    _stub_pipeline(monkeypatch, tmp_path, p_yes=0.73)
+
+    client = TestClient(ensemble_agent.app)
+    resp = client.post(
+        "/predict",
+        json={
+            "event_ticker": "E",
+            "market_ticker": "M",
+            "title": "Will X happen?",
+            "category": "Other",
+            "outcomes": ["Yes", "No"],
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "p_yes" in body
+    assert "probabilities" not in body
+    assert body["p_yes"] == pytest.approx(0.73)
+
+
 def test_predictions_endpoint_aliases_predict(monkeypatch, tmp_path) -> None:
     """/predictions behaves identically to /predict in both modes."""
     from ai_prophet.forecast import ensemble_agent
