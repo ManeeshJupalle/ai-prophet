@@ -59,6 +59,20 @@ from .temporal import (
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Hard event budget
+# ---------------------------------------------------------------------------
+
+EVENT_BUDGET_SECONDS = 55.0
+"""Soft cap on total time spent inside :func:`forecast_event` for one event.
+
+Prophet Arena's harness rejects responses past ~60 s. Each phase in
+``forecast_event`` checks remaining budget before starting work and
+short-circuits to the best partial result available (skip deliberation,
+fall back to 0.5, etc.) when the budget is exhausted. See
+``phase=timeout`` log lines for diagnostics."""
+
+
+# ---------------------------------------------------------------------------
 # Deliberation round
 # ---------------------------------------------------------------------------
 
@@ -533,6 +547,29 @@ def forecast_event(
             estimates=[fast_est],
         )
 
+    # Budget gate before strategies: if research alone burned the budget,
+    # we have research but no estimates — return the 0.5 safe fallback.
+    elapsed = time.perf_counter() - overall_start
+    if elapsed > EVENT_BUDGET_SECONDS:
+        logger.warning(
+            "phase=timeout ticker=%s stage=before_strategies elapsed=%.2fs "
+            "budget=%.0fs; returning 0.5 fallback",
+            event.market_ticker,
+            elapsed,
+            EVENT_BUDGET_SECONDS,
+        )
+        return FinalPrediction(
+            p_yes=0.5,
+            rationale=(
+                f"Timed out after research at {elapsed:.1f}s "
+                f"(budget {EVENT_BUDGET_SECONDS:.0f}s); no strategies ran."
+            ),
+            raw_p_yes=0.5,
+            agreement=0.0,
+            shrinkage=0.0,
+            estimates=[],
+        )
+
     # Phase 2: parallel strategies + market-consensus lookup (Polymarket).
     # The 4 calls are independent so they all run on the same executor.
     strat_start = time.perf_counter()
@@ -577,9 +614,24 @@ def forecast_event(
         )
         estimates = _rebalance_on_weak_research(estimates)
 
-    # Phase 2.5: optional deliberation round — one meta-LLM call adjudicates
-    # over the three analysts' estimates and produces a fourth estimate.
-    if _deliberation_enabled():
+    # Budget gate before deliberation: deliberation is one full LLM call
+    # (~5-15 s). If strategies already used the whole budget, skip it and
+    # let the ensemble run on what we have.
+    elapsed = time.perf_counter() - overall_start
+    over_budget = elapsed > EVENT_BUDGET_SECONDS
+
+    if over_budget:
+        logger.warning(
+            "phase=timeout ticker=%s stage=before_deliberation elapsed=%.2fs "
+            "budget=%.0fs; skipping deliberation, proceeding to ensemble",
+            event.market_ticker,
+            elapsed,
+            EVENT_BUDGET_SECONDS,
+        )
+    elif _deliberation_enabled():
+        # Phase 2.5: optional deliberation round — one meta-LLM call
+        # adjudicates over the three analysts' estimates and produces a
+        # fourth estimate.
         delib_start = time.perf_counter()
         delib = _deliberate(event, estimates, temporal_ctx)
         delib_elapsed = time.perf_counter() - delib_start
@@ -600,6 +652,26 @@ def forecast_event(
             )
     else:
         logger.debug("phase=deliberation disabled via ENABLE_DELIBERATION")
+
+    # Safety: if every strategy crashed and there is no market signal
+    # either, ``estimates`` is empty and ``ensemble_predict`` has nothing
+    # to combine. Return the 0.5 fallback before the ensemble math.
+    if not estimates:
+        logger.warning(
+            "phase=ensemble ticker=%s no estimates available; returning 0.5",
+            event.market_ticker,
+        )
+        return FinalPrediction(
+            p_yes=0.5,
+            rationale=(
+                "All strategies failed and no market signal was found; "
+                "returning 0.5 fallback."
+            ),
+            raw_p_yes=0.5,
+            agreement=0.0,
+            shrinkage=0.0,
+            estimates=[],
+        )
 
     # Diagnostic: show the relative weight each estimate carries into the
     # ensemble (confidence / sum of confidences). Useful for verifying
@@ -650,15 +722,20 @@ def forecast_event(
 
 
 def _prediction_delay_seconds() -> float:
-    """Read PREDICTION_DELAY from the environment, defaulting to 5 seconds.
+    """Read PREDICTION_DELAY from the environment, defaulting to 0 seconds.
 
-    Negative or unparseable values fall back to the default.
+    Default is zero: the Prophet Arena evaluation harness paces requests
+    on its side. Any extra sleep here just eats into our 60-second budget
+    per event and can cause timeouts. Override via ``PREDICTION_DELAY``
+    for local batch CLI runs that need rate-limit headroom.
+
+    Negative or unparseable values fall back to zero.
     """
-    raw = os.environ.get("PREDICTION_DELAY", "5")
+    raw = os.environ.get("PREDICTION_DELAY", "0")
     try:
         value = float(raw)
     except (TypeError, ValueError):
-        return 5.0
+        return 0.0
     return max(0.0, value)
 
 

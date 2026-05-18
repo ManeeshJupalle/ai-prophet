@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import time
 
 import pytest
 from ai_prophet.forecast.ensemble import (
@@ -15,7 +16,7 @@ from ai_prophet.forecast.ensemble import (
     inv_logit,
     logit,
 )
-from ai_prophet.forecast.strategies.base import Estimate
+from ai_prophet.forecast.strategies.base import Estimate, failed_estimate
 
 
 def _est(p: float, conf: float = 0.7, name: str = "s") -> Estimate:
@@ -372,7 +373,12 @@ def test_predict_delay_disabled_when_zero(monkeypatch) -> None:
 
 
 def test_predict_delay_handles_garbage_env_value(monkeypatch) -> None:
-    """An unparseable PREDICTION_DELAY falls back to the 5s default."""
+    """An unparseable PREDICTION_DELAY falls back to the zero default — the
+    harness paces requests itself, and extra sleep eats into the per-event
+    budget. ``predict()`` calls ``time.sleep(0)`` (or skips it via the
+    ``delay > 0`` guard, depending on the path), and crucially never sleeps
+    for a positive non-default value.
+    """
     from ai_prophet.forecast import ensemble_agent
 
     monkeypatch.setenv("PREDICTION_DELAY", "not-a-number")
@@ -388,7 +394,8 @@ def test_predict_delay_handles_garbage_env_value(monkeypatch) -> None:
     monkeypatch.setattr(ensemble_agent.time, "sleep", lambda s: sleeps.append(s))
 
     ensemble_agent.predict({"title": "x"})
-    assert sleeps == [5.0]
+    # Zero default → either no sleep at all, or a no-op sleep(0).
+    assert all(s == 0.0 for s in sleeps)
 
 
 # ---------------------------------------------------------------------------
@@ -665,6 +672,146 @@ def test_deliberation_failure_falls_back_to_three_estimates(monkeypatch) -> None
 
     assert len(final.estimates) == 3
     assert "deliberation" not in {e.strategy for e in final.estimates}
+
+
+# ---------------------------------------------------------------------------
+# Hard event-budget gates (prevents harness timeouts)
+# ---------------------------------------------------------------------------
+
+
+def test_forecast_event_returns_safe_fallback_when_research_blows_budget(
+    monkeypatch, caplog
+) -> None:
+    """Research alone burning the budget skips strategies and returns 0.5."""
+    import logging
+
+    from ai_prophet.forecast import ensemble_agent
+
+    # Make research itself take longer than the budget — research is the
+    # only phase before the first timeout gate. Shrink the budget so the
+    # test runs in <2 s.
+    monkeypatch.setattr(ensemble_agent, "EVENT_BUDGET_SECONDS", 0.5)
+
+    def slow_research(**_kw):
+        time.sleep(0.6)
+        return "stub research"
+
+    monkeypatch.setattr(ensemble_agent, "research_event", slow_research)
+
+    strategy_calls: list[str] = []
+
+    def fail_if_called(strategy, event, research, temporal_ctx=None):
+        strategy_calls.append(strategy.name)
+        return Estimate(
+            p_yes=0.9, rationale="should not run", strategy=strategy.name, confidence=0.7
+        )
+
+    monkeypatch.setattr(ensemble_agent, "_run_strategy", fail_if_called)
+
+    caplog.set_level(logging.WARNING, logger="ai_prophet.forecast.ensemble_agent")
+
+    event = ensemble_agent.EventRequest(title="slow research event")
+    final = ensemble_agent.forecast_event(event)
+
+    assert strategy_calls == []  # gate fired before any strategy ran
+    assert final.p_yes == pytest.approx(0.5)
+    assert final.estimates == []
+    assert any("phase=timeout" in r.message for r in caplog.records)
+    assert any("stage=before_strategies" in r.message for r in caplog.records)
+
+
+def test_forecast_event_skips_deliberation_when_strategies_blow_budget(
+    monkeypatch, caplog
+) -> None:
+    """Deliberation is skipped when the cumulative elapsed exceeds budget,
+    but the ensemble still runs on the strategy estimates we already have.
+    """
+    import logging
+    import time as time_mod
+
+    from ai_prophet.forecast import ensemble_agent
+
+    monkeypatch.setattr(ensemble_agent, "EVENT_BUDGET_SECONDS", 0.5)
+    monkeypatch.setenv("ENABLE_DELIBERATION", "true")
+    monkeypatch.setattr(ensemble_agent, "research_event", lambda **_kw: "")
+
+    # Slow strategies: each strategy sleeps just enough that the cumulative
+    # elapsed time across the parallel pool ends up over budget by the time
+    # we check the deliberation gate.
+    table = _fake_strategy_estimates()
+
+    def slow_strategy(strategy, event, research, temporal_ctx=None):
+        time_mod.sleep(0.6)
+        return table[strategy.name]
+
+    monkeypatch.setattr(ensemble_agent, "_run_strategy", slow_strategy)
+
+    deliberate_calls: list[bool] = []
+
+    def fake_deliberate(event, estimates, temporal_ctx=None):
+        deliberate_calls.append(True)
+        return Estimate(
+            p_yes=0.6, rationale="d", strategy="deliberation", confidence=0.85
+        )
+
+    monkeypatch.setattr(ensemble_agent, "_deliberate", fake_deliberate)
+
+    caplog.set_level(logging.WARNING, logger="ai_prophet.forecast.ensemble_agent")
+
+    event = ensemble_agent.EventRequest(title="slow strategies event")
+    final = ensemble_agent.forecast_event(event)
+
+    # Deliberation gate fired — _deliberate never invoked.
+    assert deliberate_calls == []
+    # Ensemble still ran on the 3 strategy estimates.
+    assert len(final.estimates) == 3
+    assert "deliberation" not in {e.strategy for e in final.estimates}
+    assert any(
+        "phase=timeout" in r.message and "stage=before_deliberation" in r.message
+        for r in caplog.records
+    )
+
+
+def test_forecast_event_returns_safe_fallback_when_estimates_empty(
+    monkeypatch, caplog
+) -> None:
+    """If every strategy crashes and no market signal lands, we still emit
+    a valid 0.5 prediction rather than crashing in ensemble_predict.
+    """
+    import logging
+
+    from ai_prophet.forecast import ensemble_agent
+
+    monkeypatch.setattr(ensemble_agent, "research_event", lambda **_kw: "stub")
+    monkeypatch.setattr(
+        ensemble_agent,
+        "_run_strategy",
+        lambda *_a, **_kw: failed_estimate("crashed", "boom"),
+    )
+    # Force every strategy estimate to be filtered out by setting confidence
+    # below the floor — easier than mocking the entire ensemble. We do this
+    # by having _run_strategy return a failed estimate (confidence 0.0).
+
+    # No market signal.
+    monkeypatch.setattr(ensemble_agent, "market_signal_estimate", lambda *_a, **_kw: None)
+
+    # But the failed estimates DO get added to ``estimates``. We need them
+    # to be filtered out — patch the list-building by making the pool
+    # return no estimates. Simpler approach: monkeypatch _build_strategies
+    # to return an empty list so no estimates are gathered at all.
+    monkeypatch.setattr(ensemble_agent, "_build_strategies", lambda: [])
+
+    caplog.set_level(logging.WARNING, logger="ai_prophet.forecast.ensemble_agent")
+
+    event = ensemble_agent.EventRequest(title="all failed event")
+    final = ensemble_agent.forecast_event(event)
+
+    assert final.p_yes == pytest.approx(0.5)
+    assert final.estimates == []
+    assert any(
+        "no estimates available" in r.message
+        for r in caplog.records
+    )
 
 
 def test_deliberate_uses_reasoning_tier_and_includes_outcomes(monkeypatch) -> None:

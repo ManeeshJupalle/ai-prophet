@@ -40,7 +40,7 @@ OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "anthropic/claude-sonnet-4
 
 ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
 
-DEFAULT_TIMEOUT = float(os.environ.get("LLM_TIMEOUT_SECONDS", "45"))
+DEFAULT_TIMEOUT = float(os.environ.get("LLM_TIMEOUT_SECONDS", "20"))
 RATE_LIMIT_RETRY_DELAY = float(os.environ.get("LLM_RATE_LIMIT_DELAY_SECONDS", "10"))
 
 _PROVIDER_CHAINS: dict[str, list[str]] = {
