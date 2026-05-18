@@ -901,17 +901,54 @@ def _extract_markets(event_dict: dict) -> list[str]:
     return []
 
 
+def _build_probabilities_list(p_yes: float, outcomes: list[str]) -> list[float]:
+    """Build a probability list aligned positionally to ``outcomes``.
+
+    The evaluation harness requires a ``probabilities`` array — a flat
+    list of floats, one per outcome, summing to 1.0 — alongside ``p_yes``.
+
+    Rules:
+      * 0 outcomes → empty list.
+      * 1 outcome → ``[1.0]`` (deterministic).
+      * 2 outcomes → ``[p_yes, 1 - p_yes]``.
+      * 3+ outcomes → ``p_yes`` goes to ``outcomes[0]``; the remaining mass
+        ``(1 - p_yes)`` is split uniformly across the rest. Values are
+        rounded to 4 decimals; any rounding drift is absorbed into the
+        final entry so the list always sums to exactly 1.0000.
+    """
+    n = len(outcomes)
+    if n == 0:
+        return []
+    if n == 1:
+        return [1.0]
+    if n == 2:
+        return [round(p_yes, 4), round(1.0 - p_yes, 4)]
+
+    remainder_each = (1.0 - p_yes) / (n - 1)
+    probs = [round(p_yes, 4)] + [round(remainder_each, 4)] * (n - 1)
+    drift = 1.0 - sum(probs)
+    if abs(drift) > 1e-9:
+        probs[-1] = round(probs[-1] + drift, 4)
+    return probs
+
+
 def _handle_single_event(event_dict: dict) -> dict:
     """Run one event through the cached + pacing-free pipeline.
 
     Used by both ``/predict`` (single-event mode) and ``/predictions`` /
-    ``/predict`` (batch mode). Routing by ``outcomes`` length:
+    ``/predict`` (batch mode). For every event we:
 
-    * 2 outcomes (binary) → existing :func:`predict` path, returns
-      ``{p_yes, rationale}``.
-    * 3+ outcomes (multi) → :func:`_handle_multi_outcome_event`, returns
-      ``{probabilities: [{market, probability}, ...], rationale}`` — the
-      distribution shape the forecasting harness expects.
+    1. Compute ``p_yes`` via the full binary ensemble pipeline
+       (:func:`predict`), with caching and the budget gates inside
+       :func:`forecast_event`.
+    2. Build a positional ``probabilities`` list aligned to the
+       ``outcomes`` field via :func:`_build_probabilities_list`.
+
+    The response always carries all three keys — ``p_yes``,
+    ``probabilities``, ``rationale`` — even for binary events. The
+    evaluation harness scores from ``probabilities`` and silently fails
+    requests that omit it; including ``p_yes`` keeps the legacy clients
+    that read it directly working too.
 
     Pacing is suppressed; the HTTP layer handles request-level spacing
     implicitly via inter-request gaps.
@@ -926,54 +963,39 @@ def _handle_single_event(event_dict: dict) -> dict:
         else ""
     )
 
-    # Discover the markets/outcomes list — different upstream shapes use
-    # different field names. ``outcomes`` is the canonical Event schema
-    # field (list[str]); ``markets`` is used by some payloads as a list
-    # of dicts with ``market_name``/``market_id`` entries. Accept both.
+    # Discover the outcomes list — accepts both ``outcomes`` (canonical
+    # Event schema) and ``markets`` (alternate dict-of-objects shape).
     outcomes = _extract_markets(event_dict) if isinstance(event_dict, dict) else []
 
-    if isinstance(event_dict, dict):
-        logger.info(
-            "endpoint.predict shape event_ticker=%s keys=%s outcomes_n=%d sample=%s",
-            event_t,
-            sorted(event_dict.keys()),
-            len(outcomes),
-            outcomes[:4],
-        )
-
-    if isinstance(outcomes, list) and len(outcomes) > 2:
-        logger.info(
-            "endpoint.predict request event_ticker=%s market_ticker=%s "
-            "title=%r outcomes=%d (multi)",
-            event_t,
-            market_t,
-            title,
-            len(outcomes),
-        )
-        result = _handle_multi_outcome_event(event_dict, outcomes)
-        logger.info(
-            "endpoint.predict response event_ticker=%s market_ticker=%s "
-            "probabilities=%d",
-            event_t,
-            market_t,
-            len(result.get("probabilities", [])),
-        )
-        return result
-
     logger.info(
-        "endpoint.predict request event_ticker=%s market_ticker=%s title=%r",
+        "endpoint.predict request event_ticker=%s market_ticker=%s "
+        "title=%r outcomes_n=%d",
         event_t,
         market_t,
         title,
+        len(outcomes),
     )
+
     result = predict(event_dict, _skip_pacing=True)
+    p_yes = float(result["p_yes"])
+    rationale = result["rationale"]
+
+    probabilities = _build_probabilities_list(p_yes, outcomes)
+
     logger.info(
-        "endpoint.predict response event_ticker=%s market_ticker=%s p_yes=%.4f",
+        "endpoint.predict response event_ticker=%s market_ticker=%s "
+        "p_yes=%.4f n_probs=%d",
         event_t,
         market_t,
-        result["p_yes"],
+        p_yes,
+        len(probabilities),
     )
-    return result
+
+    return {
+        "p_yes": p_yes,
+        "probabilities": probabilities,
+        "rationale": rationale,
+    }
 
 
 def _handle_multi_outcome_event(event_dict: dict, outcomes: list[str]) -> dict:

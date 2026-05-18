@@ -1383,38 +1383,18 @@ def test_predict_single_dict_still_returns_dict(monkeypatch, tmp_path) -> None:
     assert body["p_yes"] == pytest.approx(0.42)
 
 
-def test_predict_multi_outcome_returns_probabilities_array(
+def test_predict_multi_outcome_distributes_probabilities_uniformly(
     monkeypatch, tmp_path
 ) -> None:
-    """3+ outcome events return {probabilities: [{market, probability}], rationale}.
-
-    The forecasting harness rejects responses missing a ``probabilities``
-    array on distribution events, so the /predict route must emit the
-    array shape (not a dict) and include every market the event listed.
+    """3+ outcome events return ``probabilities`` as a flat list of floats
+    aligned positionally to ``outcomes``: ``p_yes`` for ``outcomes[0]``,
+    the remaining mass split uniformly over the rest. ``p_yes`` and
+    ``rationale`` are still present in the response.
     """
     from ai_prophet.forecast import ensemble_agent
     from fastapi.testclient import TestClient
 
-    monkeypatch.setenv("PREDICTION_CACHE_PATH", str(tmp_path / "cache.json"))
-    monkeypatch.setenv("ENABLE_CACHE", "false")
-
-    # Skip the network: stub research and the multi-outcome LLM call.
-    monkeypatch.setattr(
-        ensemble_agent, "research_event", lambda **_kw: "(stubbed research)"
-    )
-    monkeypatch.setattr(
-        ensemble_agent,
-        "_predict_multi_outcome",
-        lambda title, markets, research: {
-            "rationale": "stub rationale",
-            "probabilities": {
-                "Boston Celtics": 0.40,
-                "Denver Nuggets": 0.25,
-                "Minnesota Timberwolves": 0.20,
-                "Indiana Pacers": 0.15,
-            },
-        },
-    )
+    _stub_pipeline(monkeypatch, tmp_path, p_yes=0.46)
 
     client = TestClient(ensemble_agent.app)
     outcomes = [
@@ -1437,73 +1417,23 @@ def test_predict_multi_outcome_returns_probabilities_array(
     assert resp.status_code == 200
     body = resp.json()
 
-    # Shape: distribution response, not binary.
-    assert "probabilities" in body
-    assert "p_yes" not in body
+    assert body["p_yes"] == pytest.approx(0.46)
+    assert "rationale" in body
     probs = body["probabilities"]
     assert isinstance(probs, list)
     assert len(probs) == 4
-
-    # Every market present, with the right keys.
-    returned_markets = {p["market"] for p in probs}
-    assert returned_markets == set(outcomes)
-    for p in probs:
-        assert set(p.keys()) == {"market", "probability"}
-        assert 0.0 <= p["probability"] <= 1.0
-
-    # Sum-normalized to a valid distribution.
-    total = sum(p["probability"] for p in probs)
-    assert total == pytest.approx(1.0, abs=1e-6)
+    assert probs[0] == pytest.approx(0.46)
+    expected_rest = (1.0 - 0.46) / 3
+    for p in probs[1:]:
+        assert p == pytest.approx(expected_rest, abs=1e-3)
+    assert sum(probs) == pytest.approx(1.0, abs=1e-6)
 
 
-def test_predict_multi_outcome_uses_cache_on_repeat(monkeypatch, tmp_path) -> None:
-    """A repeat call with the same market_ticker should skip the LLM and serve cache."""
-    from ai_prophet.forecast import ensemble_agent
-    from fastapi.testclient import TestClient
-
-    monkeypatch.setenv("PREDICTION_CACHE_PATH", str(tmp_path / "cache.json"))
-    monkeypatch.setenv("ENABLE_CACHE", "true")
-
-    monkeypatch.setattr(
-        ensemble_agent, "research_event", lambda **_kw: "(stubbed)"
-    )
-
-    call_count = {"n": 0}
-
-    def fake_multi(title, markets, research):
-        call_count["n"] += 1
-        return {
-            "rationale": f"call #{call_count['n']}",
-            "probabilities": {m: 1.0 / len(markets) for m in markets},
-        }
-
-    monkeypatch.setattr(ensemble_agent, "_predict_multi_outcome", fake_multi)
-
-    client = TestClient(ensemble_agent.app)
-    payload = {
-        "event_ticker": "NBA-2026",
-        "market_ticker": "NBA-CHAMP-2026",
-        "title": "Who will win?",
-        "outcomes": ["A", "B", "C", "D"],
-    }
-
-    first = client.post("/predict", json=payload)
-    second = client.post("/predict", json=payload)
-    third = client.post("/predict", json=payload)
-
-    assert first.status_code == second.status_code == third.status_code == 200
-    # LLM ran exactly once across the three calls — subsequent calls served from cache.
-    assert call_count["n"] == 1
-    # Shape is preserved on cache hits.
-    for resp in (first, second, third):
-        body = resp.json()
-        assert isinstance(body["probabilities"], list)
-        assert len(body["probabilities"]) == 4
-        assert all("market" in p and "probability" in p for p in body["probabilities"])
-
-
-def test_predict_two_outcomes_still_returns_p_yes(monkeypatch, tmp_path) -> None:
-    """Binary (2-outcome) events keep returning the legacy {p_yes, rationale} shape."""
+def test_predict_two_outcomes_returns_paired_probabilities(monkeypatch, tmp_path) -> None:
+    """Binary events return ``probabilities=[p_yes, 1-p_yes]`` plus ``p_yes`` and
+    ``rationale`` — the harness requires the ``probabilities`` field on every
+    response, including binary ones.
+    """
     from ai_prophet.forecast import ensemble_agent
     from fastapi.testclient import TestClient
 
@@ -1522,9 +1452,34 @@ def test_predict_two_outcomes_still_returns_p_yes(monkeypatch, tmp_path) -> None
     )
     assert resp.status_code == 200
     body = resp.json()
-    assert "p_yes" in body
-    assert "probabilities" not in body
     assert body["p_yes"] == pytest.approx(0.73)
+    assert body["probabilities"] == [pytest.approx(0.73), pytest.approx(0.27)]
+    assert sum(body["probabilities"]) == pytest.approx(1.0, abs=1e-4)
+
+
+def test_build_probabilities_list_handles_edge_cases() -> None:
+    """0 / 1 / 2 / many outcomes all produce a valid distribution."""
+    from ai_prophet.forecast.ensemble_agent import _build_probabilities_list
+
+    # 0 outcomes → empty.
+    assert _build_probabilities_list(0.5, []) == []
+
+    # 1 outcome → [1.0] (must happen).
+    assert _build_probabilities_list(0.5, ["only"]) == [1.0]
+
+    # 2 outcomes → paired binary distribution.
+    out = _build_probabilities_list(0.7, ["Yes", "No"])
+    assert out == [pytest.approx(0.7), pytest.approx(0.3)]
+
+    # 19 outcomes — example from the urgent fix message.
+    nineteen = [f"opt-{i}" for i in range(19)]
+    out = _build_probabilities_list(0.6, nineteen)
+    assert len(out) == 19
+    assert out[0] == pytest.approx(0.6)
+    expected = (1.0 - 0.6) / 18
+    for p in out[1:]:
+        assert p == pytest.approx(expected, abs=1e-3)
+    assert sum(out) == pytest.approx(1.0, abs=1e-6)
 
 
 def test_predictions_endpoint_aliases_predict(monkeypatch, tmp_path) -> None:
