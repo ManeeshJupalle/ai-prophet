@@ -1386,10 +1386,11 @@ def test_predict_single_dict_still_returns_dict(monkeypatch, tmp_path) -> None:
 def test_predict_multi_outcome_distributes_probabilities_uniformly(
     monkeypatch, tmp_path
 ) -> None:
-    """3+ outcome events return ``probabilities`` as a flat list of floats
-    aligned positionally to ``outcomes``: ``p_yes`` for ``outcomes[0]``,
-    the remaining mass split uniformly over the rest. ``p_yes`` and
-    ``rationale`` are still present in the response.
+    """3+ outcome events return ``probabilities`` as a list of
+    ``{market, probability}`` objects aligned positionally to
+    ``outcomes``: ``p_yes`` for ``outcomes[0]``, the remaining mass
+    split uniformly over the rest. ``p_yes`` and ``rationale`` are
+    still present in the response alongside ``probabilities``.
     """
     from ai_prophet.forecast import ensemble_agent
     from fastapi.testclient import TestClient
@@ -1422,17 +1423,29 @@ def test_predict_multi_outcome_distributes_probabilities_uniformly(
     probs = body["probabilities"]
     assert isinstance(probs, list)
     assert len(probs) == 4
-    assert probs[0] == pytest.approx(0.46)
+    # Every entry is an object with the right keys.
+    for item in probs:
+        assert isinstance(item, dict)
+        assert set(item.keys()) == {"market", "probability"}
+    # Positional alignment.
+    assert probs[0]["market"] == "Boston Celtics"
+    assert probs[0]["probability"] == pytest.approx(0.46)
     expected_rest = (1.0 - 0.46) / 3
-    for p in probs[1:]:
-        assert p == pytest.approx(expected_rest, abs=1e-3)
-    assert sum(probs) == pytest.approx(1.0, abs=1e-6)
+    for item in probs[1:]:
+        assert item["probability"] == pytest.approx(expected_rest, abs=1e-3)
+    # Markets returned in input order.
+    assert [item["market"] for item in probs] == outcomes
+    # Sum to 1.
+    assert sum(item["probability"] for item in probs) == pytest.approx(
+        1.0, abs=1e-6
+    )
 
 
 def test_predict_two_outcomes_returns_paired_probabilities(monkeypatch, tmp_path) -> None:
-    """Binary events return ``probabilities=[p_yes, 1-p_yes]`` plus ``p_yes`` and
-    ``rationale`` — the harness requires the ``probabilities`` field on every
-    response, including binary ones.
+    """Binary events return ``probabilities`` as a list of two
+    ``{market, probability}`` objects plus ``p_yes`` and ``rationale``.
+    The harness requires the object shape on every response; flat-float
+    arrays raise ``ValueError: probabilities[0] must be an object``.
     """
     from ai_prophet.forecast import ensemble_agent
     from fastapi.testclient import TestClient
@@ -1453,33 +1466,44 @@ def test_predict_two_outcomes_returns_paired_probabilities(monkeypatch, tmp_path
     assert resp.status_code == 200
     body = resp.json()
     assert body["p_yes"] == pytest.approx(0.73)
-    assert body["probabilities"] == [pytest.approx(0.73), pytest.approx(0.27)]
-    assert sum(body["probabilities"]) == pytest.approx(1.0, abs=1e-4)
+    probs = body["probabilities"]
+    assert isinstance(probs, list) and len(probs) == 2
+    assert probs[0] == {"market": "Yes", "probability": pytest.approx(0.73)}
+    assert probs[1] == {"market": "No", "probability": pytest.approx(0.27)}
+    assert sum(item["probability"] for item in probs) == pytest.approx(
+        1.0, abs=1e-4
+    )
 
 
 def test_build_probabilities_list_handles_edge_cases() -> None:
-    """0 / 1 / 2 / many outcomes all produce a valid distribution."""
+    """0 / 1 / 2 / many outcomes all produce a valid distribution of objects."""
     from ai_prophet.forecast.ensemble_agent import _build_probabilities_list
 
     # 0 outcomes → empty.
     assert _build_probabilities_list(0.5, []) == []
 
-    # 1 outcome → [1.0] (must happen).
-    assert _build_probabilities_list(0.5, ["only"]) == [1.0]
+    # 1 outcome → single entry with probability 1.0.
+    out = _build_probabilities_list(0.5, ["only"])
+    assert out == [{"market": "only", "probability": 1.0}]
 
-    # 2 outcomes → paired binary distribution.
+    # 2 outcomes → paired binary distribution, objects.
     out = _build_probabilities_list(0.7, ["Yes", "No"])
-    assert out == [pytest.approx(0.7), pytest.approx(0.3)]
+    assert out[0] == {"market": "Yes", "probability": pytest.approx(0.7)}
+    assert out[1] == {"market": "No", "probability": pytest.approx(0.3)}
 
-    # 19 outcomes — example from the urgent fix message.
+    # 19 outcomes — every entry is an object, positionally aligned.
     nineteen = [f"opt-{i}" for i in range(19)]
     out = _build_probabilities_list(0.6, nineteen)
     assert len(out) == 19
-    assert out[0] == pytest.approx(0.6)
+    for item in out:
+        assert isinstance(item, dict)
+        assert set(item.keys()) == {"market", "probability"}
+    assert [item["market"] for item in out] == nineteen
+    assert out[0]["probability"] == pytest.approx(0.6)
     expected = (1.0 - 0.6) / 18
-    for p in out[1:]:
-        assert p == pytest.approx(expected, abs=1e-3)
-    assert sum(out) == pytest.approx(1.0, abs=1e-6)
+    for item in out[1:]:
+        assert item["probability"] == pytest.approx(expected, abs=1e-3)
+    assert sum(item["probability"] for item in out) == pytest.approx(1.0, abs=1e-6)
 
 
 def test_predictions_endpoint_aliases_predict(monkeypatch, tmp_path) -> None:

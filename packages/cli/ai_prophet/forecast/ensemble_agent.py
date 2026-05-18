@@ -901,35 +901,48 @@ def _extract_markets(event_dict: dict) -> list[str]:
     return []
 
 
-def _build_probabilities_list(p_yes: float, outcomes: list[str]) -> list[float]:
-    """Build a probability list aligned positionally to ``outcomes``.
+def _build_probabilities_list(
+    p_yes: float, outcomes: list[str]
+) -> list[dict[str, Any]]:
+    """Build a probability distribution aligned to ``outcomes`` as a list
+    of ``{"market": str, "probability": float}`` objects.
 
-    The evaluation harness requires a ``probabilities`` array — a flat
-    list of floats, one per outcome, summing to 1.0 — alongside ``p_yes``.
+    The evaluation harness raises ``ValueError: probabilities[0] must be
+    an object`` if entries are bare floats, so each entry is a dict with
+    ``market`` (the outcome name) and ``probability`` (the float).
 
     Rules:
       * 0 outcomes → empty list.
-      * 1 outcome → ``[1.0]`` (deterministic).
-      * 2 outcomes → ``[p_yes, 1 - p_yes]``.
-      * 3+ outcomes → ``p_yes`` goes to ``outcomes[0]``; the remaining mass
-        ``(1 - p_yes)`` is split uniformly across the rest. Values are
-        rounded to 4 decimals; any rounding drift is absorbed into the
-        final entry so the list always sums to exactly 1.0000.
+      * 1 outcome → single entry with probability ``1.0``.
+      * 2 outcomes → ``[{Yes, p_yes}, {No, 1 - p_yes}]``.
+      * 3+ outcomes → ``p_yes`` on ``outcomes[0]``; the remaining mass
+        ``(1 - p_yes)`` is split uniformly across the rest.
+
+    All probabilities are rounded to 4 decimals; any rounding drift is
+    absorbed into the final entry so the distribution sums to exactly 1.
     """
     n = len(outcomes)
     if n == 0:
         return []
     if n == 1:
-        return [1.0]
+        return [{"market": str(outcomes[0]), "probability": 1.0}]
     if n == 2:
-        return [round(p_yes, 4), round(1.0 - p_yes, 4)]
+        return [
+            {"market": str(outcomes[0]), "probability": round(p_yes, 4)},
+            {"market": str(outcomes[1]), "probability": round(1.0 - p_yes, 4)},
+        ]
 
     remainder_each = (1.0 - p_yes) / (n - 1)
-    probs = [round(p_yes, 4)] + [round(remainder_each, 4)] * (n - 1)
-    drift = 1.0 - sum(probs)
+    items: list[dict[str, Any]] = [
+        {"market": str(outcomes[0]), "probability": round(p_yes, 4)}
+    ]
+    for m in outcomes[1:]:
+        items.append({"market": str(m), "probability": round(remainder_each, 4)})
+
+    drift = 1.0 - sum(item["probability"] for item in items)
     if abs(drift) > 1e-9:
-        probs[-1] = round(probs[-1] + drift, 4)
-    return probs
+        items[-1]["probability"] = round(items[-1]["probability"] + drift, 4)
+    return items
 
 
 def _handle_single_event(event_dict: dict) -> dict:
