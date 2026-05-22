@@ -1383,62 +1383,82 @@ def test_predict_single_dict_still_returns_dict(monkeypatch, tmp_path) -> None:
     assert body["p_yes"] == pytest.approx(0.42)
 
 
-def test_predict_multi_outcome_distributes_probabilities_uniformly(
+def test_predict_multi_outcome_returns_independent_probabilities(
     monkeypatch, tmp_path
 ) -> None:
-    """3+ outcome events return ``probabilities`` as a list of
-    ``{market, probability}`` objects aligned positionally to
-    ``outcomes``: ``p_yes`` for ``outcomes[0]``, the remaining mass
-    split uniformly over the rest. ``p_yes`` and ``rationale`` are
-    still present in the response alongside ``probabilities``.
+    """3+ outcome events route through the multi-outcome LLM call and
+    emit **independent** per-market probabilities — no sum normalization.
+
+    The eval admin confirmed each outcome is scored as its own binary
+    YES Brier, so probabilities can legitimately exceed sum=1 (e.g.
+    Bitcoin-threshold events where multiple thresholds resolve YES).
     """
     from ai_prophet.forecast import ensemble_agent
     from fastapi.testclient import TestClient
 
-    _stub_pipeline(monkeypatch, tmp_path, p_yes=0.46)
+    monkeypatch.setenv("PREDICTION_CACHE_PATH", str(tmp_path / "cache.json"))
+    monkeypatch.setenv("ENABLE_CACHE", "false")
+
+    monkeypatch.setattr(
+        ensemble_agent, "research_event", lambda **_kw: "(stubbed research)"
+    )
+    # LLM returns INDEPENDENT per-market YES probabilities that
+    # intentionally sum to more than 1 — a Bitcoin-threshold-style event.
+    monkeypatch.setattr(
+        ensemble_agent,
+        "_predict_multi_outcome",
+        lambda title, markets, research: {
+            "rationale": "stubbed",
+            "probabilities": {
+                "BTC > $80k": 0.95,
+                "BTC > $90k": 0.85,
+                "BTC > $100k": 0.65,
+            },
+        },
+    )
 
     client = TestClient(ensemble_agent.app)
-    outcomes = [
-        "Boston Celtics",
-        "Denver Nuggets",
-        "Minnesota Timberwolves",
-        "Indiana Pacers",
-    ]
+    outcomes = ["BTC > $80k", "BTC > $90k", "BTC > $100k"]
     resp = client.post(
         "/predict",
         json={
-            "event_ticker": "NBA-2026",
-            "market_ticker": "NBA-CHAMP-2026",
-            "title": "Who will win the 2026 NBA championship?",
-            "category": "Sports",
-            "close_time": "2026-06-30T00:00:00Z",
+            "event_ticker": "BTC-2026",
+            "market_ticker": "BTC-THRESHOLDS-2026",
+            "title": "Will Bitcoin close above various thresholds?",
+            "category": "Crypto",
+            "close_time": "2026-12-31T00:00:00Z",
             "outcomes": outcomes,
         },
     )
     assert resp.status_code == 200
     body = resp.json()
 
-    assert body["p_yes"] == pytest.approx(0.46)
+    # Response carries p_yes (headline = outcomes[0]'s probability),
+    # probabilities (independent), and rationale.
+    assert "p_yes" in body
+    assert "probabilities" in body
     assert "rationale" in body
+
     probs = body["probabilities"]
     assert isinstance(probs, list)
-    assert len(probs) == 4
-    # Every entry is an object with the right keys.
+    assert len(probs) == 3
+
+    # Every entry is an object aligned to the input outcomes order.
     for item in probs:
-        assert isinstance(item, dict)
         assert set(item.keys()) == {"market", "probability"}
-    # Positional alignment.
-    assert probs[0]["market"] == "Boston Celtics"
-    assert probs[0]["probability"] == pytest.approx(0.46)
-    expected_rest = (1.0 - 0.46) / 3
-    for item in probs[1:]:
-        assert item["probability"] == pytest.approx(expected_rest, abs=1e-3)
-    # Markets returned in input order.
     assert [item["market"] for item in probs] == outcomes
-    # Sum to 1.
-    assert sum(item["probability"] for item in probs) == pytest.approx(
-        1.0, abs=1e-6
-    )
+
+    # Critically: the values come back unnormalized — what the LLM said,
+    # only clamped. Sum > 1 is expected and allowed.
+    assert probs[0]["probability"] == pytest.approx(0.95)
+    assert probs[1]["probability"] == pytest.approx(0.85)
+    assert probs[2]["probability"] == pytest.approx(0.65)
+    total = sum(item["probability"] for item in probs)
+    assert total > 1.0  # The whole point — no sum normalization.
+
+    # p_yes mirrors outcomes[0]'s probability so legacy binary callers
+    # still get a sensible single value.
+    assert body["p_yes"] == pytest.approx(0.95)
 
 
 def test_predict_two_outcomes_returns_paired_probabilities(monkeypatch, tmp_path) -> None:
@@ -1691,30 +1711,37 @@ NOTES:
     assert parsed["markets"] == ["Foo", "Bar"]
 
 
-def test_normalize_probabilities_sum_normalizes() -> None:
-    """A pathological LLM output like {A: .9, B: .9, C: .9} (sum 2.7)
-    must come out summing to 1.0 after _normalize_probabilities — the
-    forecasting harness penalises distributions that don't sum to 1.
+def test_normalize_probabilities_does_not_sum_normalize() -> None:
+    """Per the eval admin: probabilities are scored as INDEPENDENT binary
+    YES Briers, so the normalizer must NOT squash them to sum=1. A
+    non-mutually-exclusive event like "BTC > $80k / > $90k / > $100k"
+    can legitimately have ``[0.95, 0.85, 0.65]`` summing to 2.45 — we
+    keep those values, only clamping out-of-range inputs.
     """
     from ai_prophet.forecast.ensemble_agent import _normalize_probabilities
 
     out = _normalize_probabilities(
         {"A": 0.9, "B": 0.9, "C": 0.9}, ["A", "B", "C"]
     )
-    total = sum(out.values())
-    assert total == pytest.approx(1.0, abs=1e-6)
-    # Each value should be roughly equal (uniform after normalization).
+    # Each value preserved (within clamp range), not squashed to 1/3.
     for v in out.values():
-        assert v == pytest.approx(1.0 / 3.0, abs=1e-6)
+        assert v == pytest.approx(0.9, abs=1e-6)
+    # Sum is intentionally > 1 — that's what independent scoring requires.
+    assert sum(out.values()) > 1.0
 
 
-def test_normalize_probabilities_fills_missing_then_normalizes() -> None:
-    """Missing markets get the 1/N default before sum normalization."""
+def test_normalize_probabilities_fills_missing_with_uninformative_prior() -> None:
+    """Missing markets default to 0.5 (uninformative prior for an
+    independent YES/NO question), not ``1/N`` (which was correct only
+    under the now-incorrect mutually-exclusive assumption).
+    """
     from ai_prophet.forecast.ensemble_agent import _normalize_probabilities
 
     out = _normalize_probabilities({"A": 0.5}, ["A", "B", "C"])
     assert set(out.keys()) == {"A", "B", "C"}
-    assert sum(out.values()) == pytest.approx(1.0, abs=1e-6)
+    assert out["A"] == pytest.approx(0.5)
+    assert out["B"] == pytest.approx(0.5)
+    assert out["C"] == pytest.approx(0.5)
 
 
 def test_chat_completions_binary_uses_research_override(monkeypatch, tmp_path) -> None:
@@ -1912,29 +1939,25 @@ def test_chat_completions_unparseable_prompt_returns_safe_payload(
 
 
 def test_normalize_probabilities_clamps_and_fills() -> None:
-    """Values are clamped to [0.01, 0.99], missing fields default to 1/N,
-    then everything is sum-normalized to form a valid distribution.
+    """Values are clamped to ``[P_MIN, P_MAX]`` and missing fields default
+    to ``0.5`` (uninformative prior). Sum-normalization is intentionally
+    NOT applied — the eval scores each probability independently.
 
-    Pre-normalization values: A=0.99 (clamped from 1.5), B=0.01 (clamped
-    from -0.3), C=1/3 (default for missing). Total before normalize:
-    0.99 + 0.01 + 0.333… ≈ 1.333. After normalize each is scaled by
-    ~0.75 so the distribution sums to 1.
+    Pre-clamp values: A=1.5 (clamps to 0.99), B=-0.3 (clamps to 0.01),
+    C missing (defaults to 0.5).
     """
     from ai_prophet.forecast.ensemble_agent import _normalize_probabilities
 
     markets = ["A", "B", "C"]
     out = _normalize_probabilities({"A": 1.5, "B": -0.3}, markets)
-    # Order matters: A should still be the largest, B the smallest.
-    assert out["A"] > out["C"] > out["B"]
     # Every market present, no extras.
     assert set(out.keys()) == {"A", "B", "C"}
-    # Sum-normalized distribution.
-    assert sum(out.values()) == pytest.approx(1.0, abs=1e-6)
-    # Sanity: clamped extremes still skew the distribution heavily —
-    # A (clamp-high) carries most of the mass, B (clamp-low) carries
-    # almost none.
-    assert out["A"] > 0.5
-    assert out["B"] < 0.05
+    # Each value preserved at its clamped/default level, not rescaled.
+    assert out["A"] == pytest.approx(0.99)
+    assert out["B"] == pytest.approx(0.01)
+    assert out["C"] == pytest.approx(0.5)
+    # Sum is whatever the values are, NOT forced to 1.
+    assert sum(out.values()) == pytest.approx(0.99 + 0.01 + 0.5, abs=1e-6)
 
 
 def test_chat_completions_response_has_openai_shape(monkeypatch, tmp_path) -> None:

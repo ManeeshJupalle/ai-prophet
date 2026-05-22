@@ -949,19 +949,21 @@ def _handle_single_event(event_dict: dict) -> dict:
     """Run one event through the cached + pacing-free pipeline.
 
     Used by both ``/predict`` (single-event mode) and ``/predictions`` /
-    ``/predict`` (batch mode). For every event we:
+    ``/predict`` (batch mode). Routing by outcome count:
 
-    1. Compute ``p_yes`` via the full binary ensemble pipeline
-       (:func:`predict`), with caching and the budget gates inside
-       :func:`forecast_event`.
-    2. Build a positional ``probabilities`` list aligned to the
-       ``outcomes`` field via :func:`_build_probabilities_list`.
+    * **0-2 outcomes** → binary ensemble (:func:`predict`) plus
+      :func:`_build_probabilities_list` for a paired distribution. Binary
+      events always have ``p_yes + (1 - p_yes) = 1``, so the
+      "sums-to-1" distribution shape is correct here.
+    * **3+ outcomes** → :func:`_handle_multi_outcome_event` which calls
+      the multi-outcome LLM once and emits **independent** per-market
+      YES probabilities (no sum normalization). Per the eval admin each
+      market is scored as its own binary YES Brier and a distributed
+      sum-to-1 shape destroys Brier on non-mutually-exclusive events.
 
-    The response always carries all three keys — ``p_yes``,
-    ``probabilities``, ``rationale`` — even for binary events. The
-    evaluation harness scores from ``probabilities`` and silently fails
-    requests that omit it; including ``p_yes`` keeps the legacy clients
-    that read it directly working too.
+    The response always carries ``p_yes``, ``probabilities``, and
+    ``rationale``. ``p_yes`` is the binary ensemble result on the binary
+    path and the probability of ``outcomes[0]`` on the multi path.
 
     Pacing is suppressed; the HTTP layer handles request-level spacing
     implicitly via inter-request gaps.
@@ -989,6 +991,18 @@ def _handle_single_event(event_dict: dict) -> dict:
         len(outcomes),
     )
 
+    if len(outcomes) > 2:
+        result = _handle_multi_outcome_event(event_dict, outcomes)
+        logger.info(
+            "endpoint.predict response event_ticker=%s market_ticker=%s "
+            "p_yes=%.4f n_probs=%d shape=independent",
+            event_t,
+            market_t,
+            float(result.get("p_yes", 0.5)),
+            len(result.get("probabilities", [])),
+        )
+        return result
+
     result = predict(event_dict, _skip_pacing=True)
     p_yes = float(result["p_yes"])
     rationale = result["rationale"]
@@ -997,7 +1011,7 @@ def _handle_single_event(event_dict: dict) -> dict:
 
     logger.info(
         "endpoint.predict response event_ticker=%s market_ticker=%s "
-        "p_yes=%.4f n_probs=%d",
+        "p_yes=%.4f n_probs=%d shape=binary",
         event_t,
         market_t,
         p_yes,
@@ -1012,19 +1026,25 @@ def _handle_single_event(event_dict: dict) -> dict:
 
 
 def _handle_multi_outcome_event(event_dict: dict, outcomes: list[str]) -> dict:
-    """Run a 3+ outcome event through a single multi-outcome LLM call.
+    """Run a 3+ outcome event through a single multi-outcome LLM call,
+    emitting **independent** per-market YES probabilities.
 
-    Returns ``{probabilities: [{market, probability}, ...], rationale}`` —
-    the array shape the forecasting harness expects for distribution
-    responses. The pipeline is:
+    Per the eval admin: each outcome is scored as its own binary YES Brier,
+    so probabilities must NOT be sum-normalized. A 3-threshold event like
+    "BTC > $80k / $90k / $100k" can resolve all-YES at once; our values
+    should reflect that.
 
-    1. Cache lookup keyed on ``market_ticker``. Hits skip all LLM work.
-    2. Otherwise: gather research, single multi-outcome LLM call.
-    3. Sum-normalize so the array is a valid probability distribution.
-    4. Cache the result under the event's TTL.
+    Pipeline:
+      1. Cache lookup keyed on ``market_ticker``.
+      2. Otherwise: gather research, single multi-outcome LLM call (the
+         prompt explicitly tells the model these are independent YES/NO
+         questions and not to renormalize).
+      3. Clamp each value to ``[P_MIN, P_MAX]`` (no sum-normalization).
+      4. Cache and return.
 
-    Research / LLM failures fall back to a uniform distribution so the
-    harness never sees a malformed shape.
+    Returns ``{p_yes, probabilities: [{market, probability}, ...], rationale}``.
+    ``p_yes`` is taken from the first outcome so the response shape stays
+    backwards-compatible with binary callers.
     """
     ticker = event_dict.get("market_ticker")
 
@@ -1037,6 +1057,7 @@ def _handle_multi_outcome_event(event_dict: dict, outcomes: list[str]) -> dict:
                 cached.get("expires_at"),
             )
             return {
+                "p_yes": cached.get("p_yes", 0.5),
                 "probabilities": cached["probabilities"],
                 "rationale": cached["rationale"],
             }
@@ -1059,25 +1080,27 @@ def _handle_multi_outcome_event(event_dict: dict, outcomes: list[str]) -> dict:
 
     content = _predict_multi_outcome(title, outcomes, research)
     probs_dict = content.get("probabilities") or {}
-    n = max(1, len(outcomes))
-    default = 1.0 / n
-    probs_array = [
-        {
-            "market": str(m),
-            "probability": float(probs_dict.get(m, default)),
-        }
-        for m in outcomes
-    ]
-    total = sum(p["probability"] for p in probs_array)
-    if total > 0:
-        for p in probs_array:
-            p["probability"] = p["probability"] / total
+
+    # Build the array of independent per-market probabilities. NO sum
+    # normalization — each entry is its own binary YES probability.
+    probs_array: list[dict[str, Any]] = []
+    for m in outcomes:
+        raw = probs_dict.get(m, 0.5)
+        try:
+            v = float(raw)
+        except (TypeError, ValueError):
+            v = 0.5
+        v = max(P_MIN, min(P_MAX, v))
+        probs_array.append({"market": str(m), "probability": round(v, 4)})
+
+    p_yes = probs_array[0]["probability"] if probs_array else 0.5
     rationale = str(content.get("rationale") or "")[:1500]
 
     if cache_enabled():
-        cache_multi_outcome(ticker, probs_array, rationale)
+        cache_multi_outcome(ticker, probs_array, rationale, p_yes=p_yes)
 
     return {
+        "p_yes": p_yes,
         "probabilities": probs_array,
         "rationale": rationale,
     }
@@ -1153,21 +1176,29 @@ _OUTCOMES_BLOCK_PATTERN = re.compile(
 )
 
 _MULTI_MARKET_SYSTEM_PROMPT = """You are a calibrated forecasting analyst.
-You will be given a binary or multi-outcome prediction-market question, a
-list of POSSIBLE OUTCOMES (each is its own YES/NO question), and pre-curated
-research sources.
+You will be given a multi-outcome prediction-market question, a list of
+POSSIBLE OUTCOMES, and pre-curated research sources.
+
+CRITICAL: each outcome is an INDEPENDENT binary YES/NO question. They are
+scored independently and may ALL be true at once (e.g. "Will Bitcoin close
+above $80k / $90k / $100k?" — if BTC closes at $110k, all three are YES)
+or mutually exclusive (e.g. "Which team wins the championship?" — exactly
+one is YES). Estimate each outcome's probability ON ITS OWN MERITS without
+trying to make them sum to 1.0. Do NOT renormalize. The harness will
+NOT renormalize either.
 
 Your job: produce a probability in ``[0.01, 0.99]`` for EACH outcome,
-representing the likelihood that THAT specific outcome resolves YES. The
-probabilities should sum to approximately 1.0 when the outcomes are
-mutually exclusive (e.g. one team wins) — but do NOT renormalize blindly:
-output your honest per-outcome estimate first.
+representing the likelihood that THAT specific outcome resolves YES.
 
 Calibration discipline:
 - Brier score punishes overconfidence quadratically. Extremes (<0.10 or
   >0.90) require overwhelming evidence.
-- When evidence is thin or sources are off-topic, stay near a fair prior
-  (uniform across outcomes = ``1/N``).
+- For mutually-exclusive outcomes, your probabilities will naturally sum
+  to ~1.0 because only one can win — but don't force it.
+- For independent outcomes, each is its own 50/50 question with evidence
+  shifting it up or down independently.
+- When evidence is thin or sources are off-topic, stay near 0.5 per
+  outcome.
 - Weight sources by their ranking (lower rank = higher priority).
 - Respect the EXACT outcome names from the question — case-sensitive — and
   give a probability for EVERY outcome listed. Missing or extra outcome
@@ -1249,28 +1280,28 @@ def _parse_chat_request(messages: list[dict]) -> dict:
 def _normalize_probabilities(
     probabilities: dict[str, float], markets: list[str]
 ) -> dict[str, float]:
-    """Clamp each probability to ``[P_MIN, P_MAX]``, fill missing with ``1/N``,
-    then sum-normalize so the values form a valid distribution.
+    """Clamp each probability to ``[P_MIN, P_MAX]`` and fill missing markets.
 
-    Clamping alone is not enough: an LLM that returns
-    ``{"A": 0.9, "B": 0.9, "C": 0.9}`` would emit a sum of 2.7 and the
-    scoring harness can reject or badly score that. The final divide-by-total
-    pass guarantees the output sums to 1.0 (within float epsilon).
+    Per the eval admin's confirmation, the harness scores each market's
+    probability **independently** as its own binary YES Brier — values do
+    NOT need to (and should not) be sum-normalized to 1.0. A 3-threshold
+    event like "Bitcoin > $80k / $90k / $100k" can legitimately resolve
+    all-YES, and our submitted ``[0.9, 0.85, 0.7]`` should stay that
+    shape rather than being squashed to ``[0.37, 0.35, 0.28]`` summing
+    to 1.
+
+    Missing markets default to ``0.5`` (uninformative prior for an
+    independent YES/NO question), not ``1/N`` (which was the right
+    default only under the now-incorrect mutually-exclusive assumption).
     """
     out: dict[str, float] = {}
-    n = max(1, len(markets))
-    default = 1.0 / n
     for m in markets:
-        raw = probabilities.get(m, default)
+        raw = probabilities.get(m, 0.5)
         try:
             v = float(raw)
         except (TypeError, ValueError):
-            v = default
+            v = 0.5
         out[m] = max(P_MIN, min(P_MAX, v))
-
-    total = sum(out.values())
-    if total > 0:
-        out = {m: v / total for m, v in out.items()}
     return out
 
 

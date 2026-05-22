@@ -188,16 +188,28 @@ def cache_multi_outcome(
     probabilities: list[dict[str, Any]],
     rationale: str,
     *,
+    p_yes: float | None = None,
     ttl_hours: float | None = None,
 ) -> None:
-    """Write a multi-outcome entry. ``probabilities`` is the array shape we
-    return to callers: ``[{"market": str, "probability": float}, ...]``.
+    """Write a multi-outcome entry.
+
+    ``probabilities`` is the array shape we return to callers:
+    ``[{"market": str, "probability": float}, ...]``. ``p_yes`` is the
+    headline probability (usually that of ``outcomes[0]``) cached so
+    callers can recover the same response shape on hits without
+    recomputing it. Defaults to the first entry's probability if
+    omitted.
     """
     if not market_ticker:
         return
+    if p_yes is None:
+        p_yes = (
+            float(probabilities[0]["probability"]) if probabilities else 0.5
+        )
     ttl = ttl_hours if ttl_hours is not None else _ttl_hours()
     now = _now()
     entry = {
+        "p_yes": float(p_yes),
         "probabilities": list(probabilities),
         "rationale": str(rationale),
         "timestamp": now.isoformat(),
