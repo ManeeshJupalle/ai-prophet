@@ -768,7 +768,12 @@ def test_market_anchor_returns_ensemble_unchanged_when_no_market_signal() -> Non
 
 
 def test_market_anchor_matches_market_when_delta_small() -> None:
-    """|0.55 - 0.58| = 0.03 < 0.10 → snap to the market price 0.58."""
+    """|0.55 - 0.58| = 0.03 < 0.05 → snap to the market price 0.58.
+
+    The match-market threshold was tightened from 0.10 to 0.05 to mirror
+    the play the top leaderboard teams use: don't diverge unless you
+    have meaningful edge.
+    """
     from ai_prophet.forecast.ensemble_agent import _market_anchored_prediction
 
     final = _final(0.55, agreement=0.9)
@@ -782,10 +787,14 @@ def test_market_anchor_matches_market_when_delta_small() -> None:
 
 
 def test_market_anchor_uses_ensemble_when_delta_large_and_agreement_high() -> None:
-    """|0.80 - 0.30| = 0.50 ≥ 0.10 AND agreement > 0.75 → trust ensemble."""
+    """|0.80 - 0.30| = 0.50 ≥ 0.05 AND agreement > 0.85 → trust ensemble.
+
+    HIGH_AGREEMENT threshold raised from 0.75 to 0.85: we require
+    near-unanimous internal consensus before overriding the market.
+    """
     from ai_prophet.forecast.ensemble_agent import _market_anchored_prediction
 
-    final = _final(0.80, agreement=0.85)
+    final = _final(0.80, agreement=0.90)
     estimates = [
         _est("evidence_weighted", 0.8, 0.80),
         _est("market_consensus", 0.65, 0.30),
@@ -796,7 +805,12 @@ def test_market_anchor_uses_ensemble_when_delta_large_and_agreement_high() -> No
 
 
 def test_market_anchor_blends_when_delta_large_and_agreement_low() -> None:
-    """|0.85 - 0.30| = 0.55 ≥ 0.10 AND agreement <= 0.75 → 0.6*market + 0.4*ensemble."""
+    """|0.85 - 0.30| = 0.55 ≥ 0.05 AND agreement <= 0.85 → 0.8*market + 0.2*ensemble.
+
+    Blend weights tightened from (0.6, 0.4) to (0.8, 0.2): on weak-
+    consensus events the market is much more often right than our
+    ensemble, so the blend now pulls 4x harder toward the market.
+    """
     from ai_prophet.forecast.ensemble_agent import _market_anchored_prediction
 
     final = _final(0.85, agreement=0.55)
@@ -805,17 +819,17 @@ def test_market_anchor_blends_when_delta_large_and_agreement_low() -> None:
         _est("market_price", 0.65, 0.30),
     ]
     result = _market_anchored_prediction(final, estimates, "TICKER")
-    # 0.6 * 0.30 + 0.4 * 0.85 = 0.18 + 0.34 = 0.52
-    assert result.p_yes == pytest.approx(0.52, abs=1e-3)
+    # 0.8 * 0.30 + 0.2 * 0.85 = 0.24 + 0.17 = 0.41
+    assert result.p_yes == pytest.approx(0.41, abs=1e-3)
     assert "blend" in result.rationale
 
 
 def test_market_anchor_uses_ensemble_at_agreement_above_threshold() -> None:
-    """agreement > 0.75 (not >=) gates the use_ensemble branch."""
+    """agreement > 0.85 (not >=) gates the use_ensemble branch."""
     from ai_prophet.forecast.ensemble_agent import _market_anchored_prediction
 
-    # agreement exactly 0.75 → NOT use_ensemble (strict >); falls to blend.
-    final = _final(0.85, agreement=0.75)
+    # agreement exactly 0.85 → NOT use_ensemble (strict >); falls to blend.
+    final = _final(0.85, agreement=0.85)
     estimates = [
         _est("evidence_weighted", 0.7, 0.85),
         _est("market_price", 0.65, 0.30),
@@ -823,8 +837,8 @@ def test_market_anchor_uses_ensemble_at_agreement_above_threshold() -> None:
     result = _market_anchored_prediction(final, estimates, "TICKER")
     assert "blend" in result.rationale
 
-    # agreement just above 0.75 → use_ensemble.
-    final2 = _final(0.85, agreement=0.751)
+    # agreement just above 0.85 → use_ensemble.
+    final2 = _final(0.85, agreement=0.851)
     result2 = _market_anchored_prediction(final2, estimates, "TICKER")
     assert "use_ensemble" in result2.rationale
 

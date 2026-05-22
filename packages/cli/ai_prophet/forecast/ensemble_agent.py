@@ -345,17 +345,33 @@ def _rebalance_on_weak_research(estimates: list[Estimate]) -> list[Estimate]:
 # Market anchoring
 # ---------------------------------------------------------------------------
 
-MARKET_ANCHOR_DELTA = 0.10
+MARKET_ANCHOR_DELTA = 0.05
 """``|ensemble - market| < MARKET_ANCHOR_DELTA`` → match the market price.
-Below this gap we don't have enough edge to be worth the Brier risk."""
 
-MARKET_ANCHOR_HIGH_AGREEMENT = 0.75
+Tuned tighter than the original 0.10 because the live leaderboard showed
+top teams clustered at near-zero Brier delta vs the market baseline —
+they win by *not diverging*, not by out-forecasting. Under the scoring
+formula ``(our_brier - market_brier) * completion_rate``, matching the
+market on uncertain events caps downside hard. Below this 5% gap we
+don't have enough edge to be worth the Brier risk."""
+
+MARKET_ANCHOR_HIGH_AGREEMENT = 0.85
 """Above this strategy-agreement threshold (with a large delta) we trust
 our ensemble over the market — our analysts converged on something the
-crowd may have missed."""
+crowd may have missed.
 
-MARKET_ANCHOR_BLEND_WEIGHTS = (0.6, 0.4)
-"""(market_weight, ensemble_weight) for the blend branch."""
+Raised from 0.75 to 0.85: we require near-unanimous internal consensus
+before letting the ensemble override the market signal. Most events
+don't clear this bar, which is intended — when in doubt, match."""
+
+MARKET_ANCHOR_BLEND_WEIGHTS = (0.8, 0.2)
+"""(market_weight, ensemble_weight) for the blend branch.
+
+Shifted from (0.6, 0.4) to (0.8, 0.2). On large-delta + weak-agreement
+events, our ensemble is more often wrong than right, so the blend now
+leans 4x harder toward the market. Preserves a small ensemble pull for
+the cases where the crowd is mispriced but our analysts didn't fully
+converge."""
 
 _MARKET_STRATEGY_NAMES = frozenset({"market_price", "market_consensus"})
 
