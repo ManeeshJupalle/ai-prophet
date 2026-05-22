@@ -44,7 +44,14 @@ DEFAULT_TIMEOUT = float(os.environ.get("LLM_TIMEOUT_SECONDS", "20"))
 RATE_LIMIT_RETRY_DELAY = float(os.environ.get("LLM_RATE_LIMIT_DELAY_SECONDS", "10"))
 
 _PROVIDER_CHAINS: dict[str, list[str]] = {
-    "research": ["groq", "openrouter", "anthropic"],
+    # Both tiers now lead with OpenRouter (Claude Sonnet 4) so every
+    # analyst call benefits from Claude's calibration. Groq remains as
+    # the last-resort fallback in case OpenRouter (and Anthropic, when
+    # an ``ANTHROPIC_API_KEY`` is set) both fail — the endpoint never
+    # goes silent. Originally the ``research`` tier led with Groq for
+    # cost, but the leaderboard analysis showed Llama-driven analysts
+    # (base_rate, contrarian) were dragging the ensemble Brier.
+    "research": ["openrouter", "anthropic", "groq"],
     "reasoning": ["openrouter", "anthropic", "groq"],
 }
 
