@@ -911,29 +911,37 @@ def test_market_anchor_recognizes_market_consensus_strategy() -> None:
     assert "match_market" in result.rationale
 
 
-def test_forecast_event_anchors_to_market_when_signal_available(monkeypatch) -> None:
-    """End-to-end: forecast_event invokes anchoring before returning."""
+def test_forecast_event_short_circuits_when_market_signal_available(monkeypatch) -> None:
+    """Phase 0 short-circuit: when a market signal exists, return it
+    directly and skip the entire ensemble. Under the scoring formula
+    ``(our_brier - market_brier) * completion_rate``, matching the
+    market on covered events guarantees a near-zero Brier delta — the
+    play the top leaderboard teams (Dr Strange, partini at +0.01 to
+    +0.02) use.
+    """
     from ai_prophet.forecast import ensemble_agent
 
-    monkeypatch.setenv("ENABLE_DELIBERATION", "false")
-    monkeypatch.setattr(ensemble_agent, "research_event", lambda **_kw: "x" * 4000)
-    monkeypatch.setattr(ensemble_agent, "fast_resolve", lambda _e, _r: None)
     monkeypatch.setattr(
         ensemble_agent,
         "_market_signal_task",
         lambda _tk, _t: _est("market_price", 0.65, 0.62),
     )
 
-    table = {
-        "evidence_weighted": _est("evidence_weighted", 0.7, 0.60),
-        "base_rate": _est("base_rate", 0.55, 0.60),
-        "contrarian": _est("contrarian", 0.5, 0.60),
-    }
-    monkeypatch.setattr(
-        ensemble_agent,
-        "_run_strategy",
-        lambda strategy, event, research, temporal_ctx=None: table[strategy.name],
-    )
+    # Sentinels: these MUST NOT be called when a market signal exists.
+    research_called = {"n": 0}
+
+    def _no_research(**_kw):
+        research_called["n"] += 1
+        return "x" * 4000
+
+    strategy_called = {"n": 0}
+
+    def _no_strategy(strategy, event, research, temporal_ctx=None):
+        strategy_called["n"] += 1
+        return _est(strategy.name, 0.7, 0.60)
+
+    monkeypatch.setattr(ensemble_agent, "research_event", _no_research)
+    monkeypatch.setattr(ensemble_agent, "_run_strategy", _no_strategy)
 
     event = ensemble_agent.EventRequest(
         title="Will Lakers beat Thunder?",
@@ -942,10 +950,18 @@ def test_forecast_event_anchors_to_market_when_signal_available(monkeypatch) -> 
         outcomes=["Lakers", "Thunder"],
     )
     final = ensemble_agent.forecast_event(event)
-    # ensemble would land near 0.60 (all strategies agree); market is 0.62.
-    # |0.60 - 0.62| = 0.02 < 0.10 → match market → 0.62
-    assert final.p_yes == pytest.approx(0.62, abs=1e-3)
-    assert "match_market" in final.rationale
+
+    # Market price returned directly — no ensemble work.
+    assert final.p_yes == pytest.approx(0.62, abs=1e-6)
+    assert "market_match" in final.rationale
+    # The full pipeline must NOT have run.
+    assert research_called["n"] == 0, "research ran despite market signal"
+    assert strategy_called["n"] == 0, "strategies ran despite market signal"
+    # FinalPrediction diagnostic fields are populated.
+    assert final.agreement == 1.0
+    assert final.shrinkage == 0.0
+    assert len(final.estimates) == 1
+    assert final.estimates[0].strategy == "market_price"
 
 
 def test_forecast_event_rebalances_when_research_is_thin(monkeypatch) -> None:
