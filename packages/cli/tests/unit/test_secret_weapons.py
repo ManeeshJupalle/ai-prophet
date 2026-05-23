@@ -607,26 +607,15 @@ class _CapturingClient:
         )
 
 
-def test_kalshi_uses_auth_header_and_trading_url_when_key_set(monkeypatch) -> None:
-    monkeypatch.setenv("KALSHI_API_KEY", "test_key_xyz")
-    monkeypatch.delenv("KALSHI_API_URL", raising=False)
-    monkeypatch.setattr(market_signal.httpx, "Client", _CapturingClient)
-
-    est = kalshi_price_estimate("KX-FOO")
-    assert est is not None  # parsing worked
-    assert _CapturingClient.last_kwargs.get("headers") == {
-        "Authorization": "Bearer test_key_xyz"
-    }
-    assert "trading-api.kalshi.com" in _CapturingClient.last_url
-
-
-def test_kalshi_omits_auth_and_uses_trading_url_when_key_unset(monkeypatch) -> None:
-    """With no API key, Kalshi calls go to the public trading-api host
-    (full market universe, read-only reads are unauthenticated). The
-    legacy elections-only host is no longer the default — its inventory
-    was too narrow and prices were often missing.
+def test_kalshi_omits_auth_when_keys_unset(monkeypatch) -> None:
+    """With no ``KALSHI_API_KEY_ID``/``KALSHI_PRIVATE_KEY``, the request
+    is sent without auth headers and goes to the trading-api host. If
+    trading-api returns 401, our ``_kalshi_get`` helper auto-falls back
+    to the public elections endpoint (covered by other tests).
     """
-    monkeypatch.delenv("KALSHI_API_KEY", raising=False)
+    monkeypatch.delenv("KALSHI_API_KEY_ID", raising=False)
+    monkeypatch.delenv("KALSHI_PRIVATE_KEY", raising=False)
+    monkeypatch.delenv("KALSHI_API_KEY", raising=False)  # legacy var
     monkeypatch.delenv("KALSHI_API_URL", raising=False)
     monkeypatch.setattr(market_signal.httpx, "Client", _CapturingClient)
 
@@ -636,31 +625,69 @@ def test_kalshi_omits_auth_and_uses_trading_url_when_key_unset(monkeypatch) -> N
     assert "trading-api.kalshi.com" in _CapturingClient.last_url
 
 
-def test_kalshi_treats_whitespace_key_as_unset(monkeypatch) -> None:
-    """A whitespace-only key still goes to the public trading-api host
-    without an Authorization header."""
-    monkeypatch.setenv("KALSHI_API_KEY", "   ")
+def test_kalshi_treats_whitespace_key_id_as_unset(monkeypatch) -> None:
+    """A whitespace-only Key ID means we send no auth headers (RSA
+    signing requires a real Key ID)."""
+    monkeypatch.setenv("KALSHI_API_KEY_ID", "   ")
+    monkeypatch.delenv("KALSHI_PRIVATE_KEY", raising=False)
     monkeypatch.delenv("KALSHI_API_URL", raising=False)
     monkeypatch.setattr(market_signal.httpx, "Client", _CapturingClient)
 
     est = kalshi_price_estimate("KX-FOO")
     assert est is not None
     assert _CapturingClient.last_kwargs.get("headers") is None
-    assert "trading-api.kalshi.com" in _CapturingClient.last_url
+
+
+def test_kalshi_signs_request_when_both_keys_set(monkeypatch) -> None:
+    """With both ``KALSHI_API_KEY_ID`` and ``KALSHI_PRIVATE_KEY`` (valid
+    PEM) configured, the request includes the three RSA-PSS auth
+    headers: ``KALSHI-ACCESS-KEY``, ``KALSHI-ACCESS-TIMESTAMP``, and
+    ``KALSHI-ACCESS-SIGNATURE``.
+    """
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    # Generate an ephemeral RSA key just for this test.
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    pem = key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode()
+
+    # Clear the module-level PEM cache so this test's key is loaded fresh.
+    market_signal._PRIVATE_KEY_CACHE.clear()
+
+    monkeypatch.setenv("KALSHI_API_KEY_ID", "test-key-id-abc")
+    monkeypatch.setenv("KALSHI_PRIVATE_KEY", pem)
+    monkeypatch.delenv("KALSHI_API_URL", raising=False)
+    monkeypatch.setattr(market_signal.httpx, "Client", _CapturingClient)
+
+    est = kalshi_price_estimate("KX-FOO")
+    assert est is not None
+    headers = _CapturingClient.last_kwargs.get("headers") or {}
+    assert headers.get("KALSHI-ACCESS-KEY") == "test-key-id-abc"
+    assert headers.get("KALSHI-ACCESS-TIMESTAMP") is not None
+    assert headers.get("KALSHI-ACCESS-SIGNATURE") is not None
+    # Signature is base64-encoded.
+    import base64
+    sig_raw = base64.b64decode(headers["KALSHI-ACCESS-SIGNATURE"])
+    assert len(sig_raw) == 256  # 2048-bit RSA signature is 256 bytes
 
 
 def test_kalshi_explicit_url_override_wins(monkeypatch) -> None:
-    """KALSHI_API_URL beats the auto-selected URL even when a key is set."""
-    monkeypatch.setenv("KALSHI_API_KEY", "test_key_xyz")
+    """``KALSHI_API_URL`` beats the auto-selected URL even when other
+    Kalshi-related env vars are set. Auth headers are still attempted
+    if Key ID + private key are configured, but the URL is the explicit
+    one.
+    """
     monkeypatch.setenv("KALSHI_API_URL", "https://my-custom-host.example/v2/markets")
+    monkeypatch.delenv("KALSHI_API_KEY_ID", raising=False)
+    monkeypatch.delenv("KALSHI_PRIVATE_KEY", raising=False)
     monkeypatch.setattr(market_signal.httpx, "Client", _CapturingClient)
 
     est = kalshi_price_estimate("KX-FOO")
     assert est is not None
-    # Auth header is still sent (key was set), but the URL is the explicit one.
-    assert _CapturingClient.last_kwargs.get("headers") == {
-        "Authorization": "Bearer test_key_xyz"
-    }
     assert _CapturingClient.last_url == "https://my-custom-host.example/v2/markets/KX-FOO"
 
 

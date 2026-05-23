@@ -28,10 +28,13 @@ all return ``None`` — never an exception.
 
 from __future__ import annotations
 
+import base64
 import logging
 import os
 import re
+import time
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
@@ -40,14 +43,19 @@ from .strategies.base import Estimate, clamp_probability
 logger = logging.getLogger(__name__)
 
 KALSHI_TRADING_URL = "https://trading-api.kalshi.com/trade-api/v2/markets"
-"""Main Kalshi trading API. Read-only endpoints (market data) are public
-and do NOT require auth — only order-placing uses RSA-PSS-signed
-requests, which we don't do."""
+"""Main Kalshi trading host. All read endpoints require RSA-PSS-signed
+auth (despite being "market data" they're not anonymous). When the auth
+env vars are set we use this host; otherwise we fall back to the public
+elections endpoint."""
 
 KALSHI_ELECTIONS_URL = "https://api.elections.kalshi.com/trade-api/v2/markets"
-"""Legacy fallback. The elections-only host has very limited inventory
-(only US-political markets) and missing prices on many entries. Only
-used if ``KALSHI_API_URL`` is explicitly overridden to it."""
+"""Public no-auth fallback. Limited to US-political markets but works
+without credentials. Used when ``KALSHI_API_KEY_ID``+``KALSHI_PRIVATE_KEY``
+are missing OR when trading-api returns 401/403/5xx."""
+
+# Auth env vars (both required for signing):
+KALSHI_KEY_ID_ENV = "KALSHI_API_KEY_ID"
+KALSHI_PRIVATE_KEY_ENV = "KALSHI_PRIVATE_KEY"
 
 POLYMARKET_URL = os.environ.get(
     "POLYMARKET_API_URL",
@@ -138,6 +146,133 @@ def _yes_price_from_market(market: dict[str, Any]) -> float | None:
 
 
 # ---------------------------------------------------------------------------
+# Kalshi: auth + HTTP helpers
+# ---------------------------------------------------------------------------
+
+
+_PRIVATE_KEY_CACHE: dict[str, Any] = {}
+
+
+def _load_kalshi_private_key():
+    """Load + cache the RSA private key from env. Returns ``None`` if missing
+    or malformed.
+
+    The PEM may be supplied either as the raw multiline PEM (preferred) or
+    as a base64-encoded blob of the same. Falls back gracefully on parse
+    errors so the rest of the pipeline isn't blocked.
+    """
+    raw = os.environ.get(KALSHI_PRIVATE_KEY_ENV, "").strip()
+    if not raw:
+        return None
+
+    cached = _PRIVATE_KEY_CACHE.get(raw)
+    if cached is not None:
+        return cached
+
+    try:
+        from cryptography.hazmat.primitives.serialization import load_pem_private_key
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("cryptography lib not available: %s", exc)
+        return None
+
+    pem_bytes: bytes
+    if "-----BEGIN" in raw:
+        pem_bytes = raw.encode()
+    else:
+        # Maybe base64-wrapped — try decoding once.
+        try:
+            pem_bytes = base64.b64decode(raw)
+        except Exception:  # noqa: BLE001
+            logger.warning("KALSHI_PRIVATE_KEY is neither PEM nor base64")
+            return None
+
+    try:
+        key = load_pem_private_key(pem_bytes, password=None)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("KALSHI_PRIVATE_KEY parse failed: %s", exc)
+        return None
+
+    _PRIVATE_KEY_CACHE[raw] = key
+    return key
+
+
+def _kalshi_auth_headers(method: str, url: str) -> dict[str, str] | None:
+    """Build the Kalshi RSA-PSS signed auth headers for one request.
+
+    Per Kalshi docs, the signed string is ``f"{ts_ms}{METHOD}{PATH}"`` —
+    PATH being the URL's path component only (no host, no query string).
+    Returns ``None`` if either auth env var is missing or the private key
+    can't be loaded.
+    """
+    key_id = os.environ.get(KALSHI_KEY_ID_ENV, "").strip()
+    if not key_id:
+        return None
+
+    private_key = _load_kalshi_private_key()
+    if private_key is None:
+        return None
+
+    try:
+        from cryptography.exceptions import UnsupportedAlgorithm
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import padding
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("cryptography lib import failed: %s", exc)
+        return None
+
+    parsed = urlparse(url)
+    path = parsed.path or "/"
+    timestamp_ms = str(int(time.time() * 1000))
+    msg = (timestamp_ms + method.upper() + path).encode()
+
+    try:
+        signature = private_key.sign(
+            msg,
+            padding.PSS(
+                mgf=padding.MGF1(hashes.SHA256()),
+                salt_length=padding.PSS.DIGEST_LENGTH,
+            ),
+            hashes.SHA256(),
+        )
+    except (UnsupportedAlgorithm, Exception) as exc:  # noqa: BLE001
+        logger.warning("kalshi signing failed: %s", exc)
+        return None
+
+    return {
+        "KALSHI-ACCESS-KEY": key_id,
+        "KALSHI-ACCESS-TIMESTAMP": timestamp_ms,
+        "KALSHI-ACCESS-SIGNATURE": base64.b64encode(signature).decode(),
+    }
+
+
+def _kalshi_get(url: str, params: dict[str, Any] | None = None) -> dict | list | None:
+    """GET a Kalshi URL with auth if configured, fall back to elections on 401/403/5xx.
+
+    Returns the parsed JSON body on success, ``None`` on any failure.
+    """
+    try:
+        headers = _kalshi_auth_headers("GET", url)
+        with httpx.Client(timeout=REQUEST_TIMEOUT, headers=headers) as client:
+            resp = client.get(url, params=params)
+        if resp.status_code in (401, 403) or resp.status_code >= 500:
+            # Auth or server failure on trading-api → try elections.
+            if KALSHI_TRADING_URL in url:
+                fallback_url = url.replace(KALSHI_TRADING_URL, KALSHI_ELECTIONS_URL)
+                logger.info(
+                    "kalshi trading-api %s; falling back to elections %s",
+                    resp.status_code,
+                    fallback_url,
+                )
+                with httpx.Client(timeout=REQUEST_TIMEOUT) as client:
+                    resp = client.get(fallback_url, params=params)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as exc:  # noqa: BLE001
+        logger.info("kalshi GET failed url=%s: %s", url, exc)
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Kalshi: direct ticker lookup (primary)
 # ---------------------------------------------------------------------------
 
@@ -197,23 +332,14 @@ def kalshi_price_estimate(
     if not ticker:
         return None
 
-    # Default to trading-api (public reads, full market universe). Tests
-    # and ops can override via ``KALSHI_API_URL``. ``KALSHI_API_KEY`` is
-    # honored if present (sent as bearer), though Kalshi's actual auth
-    # is RSA-signed — the bearer header is just ignored for public reads
-    # and harmless either way.
+    # ``KALSHI_API_URL`` override beats auto-selection (used in tests).
+    # Default: trading-api (signed auth when KALSHI_API_KEY_ID +
+    # KALSHI_PRIVATE_KEY are set; auto-falls back to elections on 401/5xx).
     base = os.environ.get("KALSHI_API_URL") or KALSHI_TRADING_URL
-    api_key = os.environ.get("KALSHI_API_KEY", "").strip()
-    headers = {"Authorization": f"Bearer {api_key}"} if api_key else None
-
     url = f"{base.rstrip('/')}/{ticker}"
-    try:
-        with httpx.Client(timeout=REQUEST_TIMEOUT, headers=headers) as client:
-            resp = client.get(url)
-        resp.raise_for_status()
-        payload = resp.json()
-    except Exception as exc:  # noqa: BLE001 — never block pipeline
-        logger.info("kalshi lookup failed ticker=%s: %s", ticker, exc)
+    payload = _kalshi_get(url)
+    if payload is None:
+        logger.info("kalshi lookup failed ticker=%s", ticker)
         return None
 
     # Kalshi wraps the record as {"market": {...}}; tolerate a bare dict too.
@@ -387,19 +513,12 @@ def kalshi_event_markets(event_ticker: str | None) -> list[dict[str, Any]] | Non
         return None
 
     base = os.environ.get("KALSHI_API_URL") or KALSHI_TRADING_URL
-    api_key = os.environ.get("KALSHI_API_KEY", "").strip()
-    headers = {"Authorization": f"Bearer {api_key}"} if api_key else None
-
-    try:
-        with httpx.Client(timeout=REQUEST_TIMEOUT, headers=headers) as client:
-            resp = client.get(
-                base.rstrip("/"),
-                params={"event_ticker": ticker, "limit": 1000},
-            )
-        resp.raise_for_status()
-        payload = resp.json()
-    except Exception as exc:  # noqa: BLE001 — never block pipeline
-        logger.info("kalshi event lookup failed event=%s: %s", ticker, exc)
+    payload = _kalshi_get(
+        base.rstrip("/"),
+        params={"event_ticker": ticker, "limit": 1000},
+    )
+    if payload is None:
+        logger.info("kalshi event lookup failed event=%s", ticker)
         return None
 
     # Kalshi wraps the list as {"markets": [...]} typically.
