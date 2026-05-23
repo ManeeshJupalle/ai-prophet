@@ -620,7 +620,12 @@ def test_kalshi_uses_auth_header_and_trading_url_when_key_set(monkeypatch) -> No
     assert "trading-api.kalshi.com" in _CapturingClient.last_url
 
 
-def test_kalshi_omits_auth_and_uses_elections_url_when_key_unset(monkeypatch) -> None:
+def test_kalshi_omits_auth_and_uses_trading_url_when_key_unset(monkeypatch) -> None:
+    """With no API key, Kalshi calls go to the public trading-api host
+    (full market universe, read-only reads are unauthenticated). The
+    legacy elections-only host is no longer the default — its inventory
+    was too narrow and prices were often missing.
+    """
     monkeypatch.delenv("KALSHI_API_KEY", raising=False)
     monkeypatch.delenv("KALSHI_API_URL", raising=False)
     monkeypatch.setattr(market_signal.httpx, "Client", _CapturingClient)
@@ -628,11 +633,12 @@ def test_kalshi_omits_auth_and_uses_elections_url_when_key_unset(monkeypatch) ->
     est = kalshi_price_estimate("KX-FOO")
     assert est is not None
     assert _CapturingClient.last_kwargs.get("headers") is None
-    assert "api.elections.kalshi.com" in _CapturingClient.last_url
+    assert "trading-api.kalshi.com" in _CapturingClient.last_url
 
 
 def test_kalshi_treats_whitespace_key_as_unset(monkeypatch) -> None:
-    """A key value of just whitespace should NOT trigger auth mode."""
+    """A whitespace-only key still goes to the public trading-api host
+    without an Authorization header."""
     monkeypatch.setenv("KALSHI_API_KEY", "   ")
     monkeypatch.delenv("KALSHI_API_URL", raising=False)
     monkeypatch.setattr(market_signal.httpx, "Client", _CapturingClient)
@@ -640,7 +646,7 @@ def test_kalshi_treats_whitespace_key_as_unset(monkeypatch) -> None:
     est = kalshi_price_estimate("KX-FOO")
     assert est is not None
     assert _CapturingClient.last_kwargs.get("headers") is None
-    assert "api.elections.kalshi.com" in _CapturingClient.last_url
+    assert "trading-api.kalshi.com" in _CapturingClient.last_url
 
 
 def test_kalshi_explicit_url_override_wins(monkeypatch) -> None:
@@ -656,6 +662,97 @@ def test_kalshi_explicit_url_override_wins(monkeypatch) -> None:
         "Authorization": "Bearer test_key_xyz"
     }
     assert _CapturingClient.last_url == "https://my-custom-host.example/v2/markets/KX-FOO"
+
+
+# ---------------------------------------------------------------------------
+# kalshi_multi_outcome_probabilities — per-outcome market price lookup
+# ---------------------------------------------------------------------------
+
+
+def test_kalshi_multi_outcome_matches_each_outcome_to_a_child_market(
+    monkeypatch,
+) -> None:
+    """For a multi-outcome event, fetch all child markets and align each
+    one to the input ``outcomes`` list by token overlap. Each match's
+    price becomes that outcome's probability; unmatched outcomes get
+    the uninformative 0.5 prior.
+
+    Crucially, the output is INDEPENDENT per the eval admin's
+    confirmation — values are not sum-normalized.
+    """
+    from ai_prophet.forecast.market_signal import (
+        kalshi_multi_outcome_probabilities,
+    )
+
+    # Stub the child-markets fetch to return 3 fake Kalshi markets, each
+    # with a label that aligns to one of the input outcomes.
+    fake_markets = [
+        {"ticker": "EVT-T80", "yes_sub_title": "BTC above $80k", "last_price": 95},
+        {"ticker": "EVT-T90", "yes_sub_title": "BTC above $90k", "last_price": 70},
+        {"ticker": "EVT-T100", "yes_sub_title": "BTC above $100k", "last_price": 30},
+    ]
+    monkeypatch.setattr(
+        market_signal, "kalshi_event_markets", lambda _evt: fake_markets
+    )
+
+    outcomes = ["BTC above $80k", "BTC above $90k", "BTC above $100k"]
+    out = kalshi_multi_outcome_probabilities("EVT-123", outcomes)
+
+    assert out is not None
+    assert len(out) == 3
+    # Each output entry is an object with the right keys.
+    for item in out:
+        assert set(item.keys()) == {"market", "probability"}
+    # Positional alignment to input outcomes.
+    assert [item["market"] for item in out] == outcomes
+    # Prices in cents map to probabilities, no sum-normalization.
+    assert out[0]["probability"] == pytest.approx(0.95)
+    assert out[1]["probability"] == pytest.approx(0.70)
+    assert out[2]["probability"] == pytest.approx(0.30)
+    # The sum is 1.95 — definitively NOT normalized to 1.
+    total = sum(item["probability"] for item in out)
+    assert total == pytest.approx(1.95, abs=1e-3)
+
+
+def test_kalshi_multi_outcome_returns_none_when_no_child_markets(monkeypatch) -> None:
+    """If the event has no child markets on Kalshi, return None so the
+    caller can fall through to the LLM path."""
+    from ai_prophet.forecast.market_signal import (
+        kalshi_multi_outcome_probabilities,
+    )
+
+    monkeypatch.setattr(market_signal, "kalshi_event_markets", lambda _evt: None)
+
+    out = kalshi_multi_outcome_probabilities("EVT-MISSING", ["A", "B", "C"])
+    assert out is None
+
+
+def test_kalshi_multi_outcome_uses_0_5_prior_for_unmatched_outcomes(
+    monkeypatch,
+) -> None:
+    """If only some outcomes match a child market, the others get the
+    0.5 uninformative prior. Match count must be > 0 for the helper to
+    return a non-None result (otherwise the LLM fallback should run).
+    """
+    from ai_prophet.forecast.market_signal import (
+        kalshi_multi_outcome_probabilities,
+    )
+
+    # Only one child market exists; the input has three outcomes.
+    fake_markets = [
+        {"ticker": "EVT-A", "subtitle": "Outcome alpha resolves yes", "last_price": 65},
+    ]
+    monkeypatch.setattr(
+        market_signal, "kalshi_event_markets", lambda _evt: fake_markets
+    )
+
+    outcomes = ["Outcome alpha resolves yes", "totally unrelated text", "another miss"]
+    out = kalshi_multi_outcome_probabilities("EVT-PARTIAL", outcomes)
+
+    assert out is not None
+    assert out[0]["probability"] == pytest.approx(0.65)
+    assert out[1]["probability"] == pytest.approx(0.5)
+    assert out[2]["probability"] == pytest.approx(0.5)
 
 
 # ---------------------------------------------------------------------------

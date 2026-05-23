@@ -40,10 +40,14 @@ from .strategies.base import Estimate, clamp_probability
 logger = logging.getLogger(__name__)
 
 KALSHI_TRADING_URL = "https://trading-api.kalshi.com/trade-api/v2/markets"
-"""Main Kalshi trading API — requires ``KALSHI_API_KEY`` (sent as bearer)."""
+"""Main Kalshi trading API. Read-only endpoints (market data) are public
+and do NOT require auth — only order-placing uses RSA-PSS-signed
+requests, which we don't do."""
 
 KALSHI_ELECTIONS_URL = "https://api.elections.kalshi.com/trade-api/v2/markets"
-"""Public elections-only endpoint — no auth required, but limited inventory."""
+"""Legacy fallback. The elections-only host has very limited inventory
+(only US-political markets) and missing prices on many entries. Only
+used if ``KALSHI_API_URL`` is explicitly overridden to it."""
 
 POLYMARKET_URL = os.environ.get(
     "POLYMARKET_API_URL",
@@ -193,12 +197,13 @@ def kalshi_price_estimate(
     if not ticker:
         return None
 
-    # Read env at call time so a key added mid-process takes effect, and so
-    # tests can override via monkeypatch. Explicit ``KALSHI_API_URL`` wins.
+    # Default to trading-api (public reads, full market universe). Tests
+    # and ops can override via ``KALSHI_API_URL``. ``KALSHI_API_KEY`` is
+    # honored if present (sent as bearer), though Kalshi's actual auth
+    # is RSA-signed — the bearer header is just ignored for public reads
+    # and harmless either way.
+    base = os.environ.get("KALSHI_API_URL") or KALSHI_TRADING_URL
     api_key = os.environ.get("KALSHI_API_KEY", "").strip()
-    base = os.environ.get("KALSHI_API_URL") or (
-        KALSHI_TRADING_URL if api_key else KALSHI_ELECTIONS_URL
-    )
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else None
 
     url = f"{base.rstrip('/')}/{ticker}"
@@ -356,10 +361,173 @@ def market_signal_estimate(
     return None
 
 
+# ---------------------------------------------------------------------------
+# Kalshi: multi-outcome (event-level) child-markets lookup
+# ---------------------------------------------------------------------------
+
+
+def kalshi_event_markets(event_ticker: str | None) -> list[dict[str, Any]] | None:
+    """Fetch all child markets for an event from Kalshi.
+
+    Multi-outcome events on Kalshi have one **event_ticker** with N
+    **child markets**, each its own binary YES/NO question — e.g.
+    ``KXAAAGASD-26MAY24`` (event) has children ``KXAAAGASD-26MAY24-T0.10``,
+    ``KXAAAGASD-26MAY24-T0.15``, etc. The endpoint
+    ``GET /markets?event_ticker=<ticker>`` returns them all in one call.
+
+    Returns the list of market dicts (each containing ``ticker``,
+    ``subtitle``/``yes_sub_title``/``title`` for matching, and price
+    fields ``last_price``/``yes_bid``/``yes_ask``). Returns ``None`` on
+    any failure — caller falls back to other paths.
+    """
+    if not event_ticker:
+        return None
+    ticker = str(event_ticker).strip()
+    if not ticker:
+        return None
+
+    base = os.environ.get("KALSHI_API_URL") or KALSHI_TRADING_URL
+    api_key = os.environ.get("KALSHI_API_KEY", "").strip()
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else None
+
+    try:
+        with httpx.Client(timeout=REQUEST_TIMEOUT, headers=headers) as client:
+            resp = client.get(
+                base.rstrip("/"),
+                params={"event_ticker": ticker, "limit": 1000},
+            )
+        resp.raise_for_status()
+        payload = resp.json()
+    except Exception as exc:  # noqa: BLE001 — never block pipeline
+        logger.info("kalshi event lookup failed event=%s: %s", ticker, exc)
+        return None
+
+    # Kalshi wraps the list as {"markets": [...]} typically.
+    if isinstance(payload, dict):
+        markets = payload.get("markets")
+    elif isinstance(payload, list):
+        markets = payload
+    else:
+        return None
+
+    if not isinstance(markets, list) or not markets:
+        logger.info("kalshi event=%s returned no markets", ticker)
+        return None
+
+    return markets
+
+
+def _market_label(market: dict[str, Any]) -> str:
+    """Pull the most outcome-descriptive label from a Kalshi child market.
+
+    Kalshi child markets carry the outcome description in several fields
+    depending on event type. We try the most-specific first and fall
+    back through generic ones.
+    """
+    for field in ("yes_sub_title", "subtitle", "sub_title", "title", "ticker"):
+        v = market.get(field)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return ""
+
+
+def kalshi_multi_outcome_probabilities(
+    event_ticker: str | None, outcomes: list[str]
+) -> list[dict[str, Any]] | None:
+    """For a multi-outcome event, fetch child markets and align prices
+    to the input ``outcomes`` list.
+
+    Returns ``[{"market": str, "probability": float}, ...]`` aligned
+    positionally to ``outcomes`` if at least one outcome was matched
+    to a Kalshi child market with a usable price; otherwise ``None``.
+
+    Matching strategy per outcome:
+      1. Build a normalized token set for the outcome string.
+      2. For each child market, build a token set from
+         ``yes_sub_title``/``subtitle``/``title``.
+      3. Pick the child whose tokens have the highest Jaccard overlap,
+         provided the overlap is at least ``MIN_OVERLAP`` shared tokens.
+      4. Use the child's ``yes_*`` price as that outcome's probability.
+
+    Outcomes without a match get ``0.5`` (uninformative prior). The
+    output is independent (no sum normalization) per the eval's
+    independent-binary-YES scoring rule.
+    """
+    if not event_ticker or not outcomes:
+        return None
+
+    markets = kalshi_event_markets(event_ticker)
+    if not markets:
+        return None
+
+    # Pre-compute token sets for each child market.
+    market_tokens: list[tuple[dict[str, Any], set[str]]] = []
+    for m in markets:
+        if not isinstance(m, dict):
+            continue
+        label = _market_label(m)
+        tokens = _normalize(label) if label else set()
+        if tokens:
+            market_tokens.append((m, tokens))
+
+    if not market_tokens:
+        logger.info(
+            "kalshi event=%s child markets had no usable labels",
+            event_ticker,
+        )
+        return None
+
+    matched_count = 0
+    out: list[dict[str, Any]] = []
+    for outcome in outcomes:
+        outcome_str = str(outcome)
+        outcome_tokens = _normalize(outcome_str)
+
+        best_market: dict[str, Any] | None = None
+        best_score = 0.0
+        if outcome_tokens:
+            for m, m_tokens in market_tokens:
+                overlap = len(outcome_tokens & m_tokens)
+                if overlap < 1:
+                    continue
+                score = _jaccard(outcome_tokens, m_tokens)
+                if score > best_score:
+                    best_score = score
+                    best_market = m
+
+        prob = 0.5
+        if best_market is not None:
+            yes_cents = _kalshi_yes_price_cents(best_market)
+            if yes_cents is not None:
+                prob = clamp_probability(yes_cents / 100.0)
+                matched_count += 1
+
+        out.append({"market": outcome_str, "probability": round(prob, 4)})
+
+    if matched_count == 0:
+        logger.info(
+            "kalshi event=%s matched 0/%d outcomes to child markets",
+            event_ticker,
+            len(outcomes),
+        )
+        return None
+
+    logger.info(
+        "kalshi event=%s matched %d/%d outcomes (children=%d)",
+        event_ticker,
+        matched_count,
+        len(outcomes),
+        len(market_tokens),
+    )
+    return out
+
+
 __all__ = [
     "MARKET_CONSENSUS_CONFIDENCE",
     "MIN_JACCARD",
     "MIN_OVERLAP",
+    "kalshi_event_markets",
+    "kalshi_multi_outcome_probabilities",
     "kalshi_price_estimate",
     "market_consensus_estimate",
     "market_signal_estimate",

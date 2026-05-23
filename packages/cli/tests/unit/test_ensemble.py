@@ -734,6 +734,12 @@ def test_forecast_event_skips_deliberation_when_strategies_blow_budget(
     monkeypatch.setattr(ensemble_agent, "EVENT_BUDGET_SECONDS", 0.5)
     monkeypatch.setenv("ENABLE_DELIBERATION", "true")
     monkeypatch.setattr(ensemble_agent, "research_event", lambda **_kw: "")
+    # Phase 0 short-circuits if a market signal exists, so we stub it to
+    # always return None — forces the ensemble path. Without this stub
+    # the real HTTP call to Kalshi/Polymarket would burn the test budget.
+    monkeypatch.setattr(
+        ensemble_agent, "_market_signal_task", lambda _tk, _t: None
+    )
 
     # Slow strategies: each strategy sleeps just enough that the cumulative
     # elapsed time across the parallel pool ends up over budget by the time

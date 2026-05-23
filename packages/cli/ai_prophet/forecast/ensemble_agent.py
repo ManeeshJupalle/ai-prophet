@@ -37,7 +37,10 @@ from .cache import (
 )
 from .ensemble import P_MAX, P_MIN, FinalPrediction, ensemble_predict
 from .llm_utils import call_llm_json, fast_resolve
-from .market_signal import market_signal_estimate
+from .market_signal import (
+    kalshi_multi_outcome_probabilities,
+    market_signal_estimate,
+)
 from .researcher import research_event
 from .strategies import (
     BaseRateStrategy,
@@ -1104,6 +1107,36 @@ def _handle_multi_outcome_event(event_dict: dict, outcomes: list[str]) -> dict:
     backwards-compatible with binary callers.
     """
     ticker = event_dict.get("market_ticker")
+    event_ticker = event_dict.get("event_ticker") or ticker
+
+    # Phase 0 (multi-outcome): try Kalshi's event-level lookup before
+    # spending any LLM tokens. The eval is Kalshi-based, so most
+    # multi-outcome events have N child markets (one per outcome) with
+    # live prices we can use directly. Matching the market avoids the
+    # Brier penalty for confident wrong guesses on non-mutually-
+    # exclusive distributions.
+    kalshi_probs = kalshi_multi_outcome_probabilities(event_ticker, outcomes)
+    if kalshi_probs is not None:
+        p_yes = float(kalshi_probs[0]["probability"]) if kalshi_probs else 0.5
+        rationale = (
+            f"Kalshi event={event_ticker} matched "
+            f"{sum(1 for p in kalshi_probs if p['probability'] != 0.5)}/"
+            f"{len(outcomes)} outcomes to live child markets; using "
+            "market prices directly."
+        )
+        logger.info(
+            "phase=market_match_multi event=%s n_probs=%d p_yes=%.3f",
+            event_ticker,
+            len(kalshi_probs),
+            p_yes,
+        )
+        if cache_enabled():
+            cache_multi_outcome(ticker, kalshi_probs, rationale, p_yes=p_yes)
+        return {
+            "p_yes": p_yes,
+            "probabilities": kalshi_probs,
+            "rationale": rationale,
+        }
 
     if cache_enabled():
         cached = get_cached_multi_outcome(ticker)
