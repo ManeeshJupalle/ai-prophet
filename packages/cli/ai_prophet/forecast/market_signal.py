@@ -206,10 +206,18 @@ def _kalshi_auth_headers(method: str, url: str) -> dict[str, str] | None:
     """
     key_id = os.environ.get(KALSHI_KEY_ID_ENV, "").strip()
     if not key_id:
+        logger.info(
+            "kalshi auth skipped: %s env var not set (will hit elections fallback)",
+            KALSHI_KEY_ID_ENV,
+        )
         return None
 
     private_key = _load_kalshi_private_key()
     if private_key is None:
+        logger.info(
+            "kalshi auth skipped: %s missing or unparseable (will hit elections fallback)",
+            KALSHI_PRIVATE_KEY_ENV,
+        )
         return None
 
     try:
@@ -579,40 +587,82 @@ def kalshi_multi_outcome_probabilities(
     if not markets:
         return None
 
-    # Pre-compute token sets for each child market.
-    market_tokens: list[tuple[dict[str, Any], set[str]]] = []
+    # Pre-compute label, ticker, and token set for each child market.
+    market_meta: list[tuple[dict[str, Any], str, str, set[str]]] = []
     for m in markets:
         if not isinstance(m, dict):
             continue
         label = _market_label(m)
+        ticker = str(m.get("ticker") or "")
         tokens = _normalize(label) if label else set()
-        if tokens:
-            market_tokens.append((m, tokens))
+        # Even labels with no usable tokens (e.g. just a number) are kept,
+        # since substring/ticker matches can still find them.
+        market_meta.append((m, label.lower(), ticker.lower(), tokens))
 
-    if not market_tokens:
+    if not market_meta:
         logger.info(
-            "kalshi event=%s child markets had no usable labels",
+            "kalshi event=%s returned only malformed child markets",
             event_ticker,
         )
         return None
+
+    def _match_outcome(outcome_str: str) -> dict[str, Any] | None:
+        """Find the best child market for ``outcome_str``.
+
+        Three strategies, in order of strictness:
+          1. **Jaccard token overlap** — highest score wins if any tokens
+             overlap. Good for "Boston Celtics" → "Boston Celtics".
+          2. **Substring match** — case-insensitive, in either direction.
+             Catches "Increase" → "Approval rating increase".
+          3. **Ticker suffix match** — outcome string appears in the
+             ticker (case-insensitive, stripped of non-alphanumerics).
+             Catches "0.10" → "EVT-T0.10".
+        """
+        outcome_lower = outcome_str.lower().strip()
+        outcome_tokens = _normalize(outcome_str)
+
+        # Strategy 1: Jaccard
+        best: dict[str, Any] | None = None
+        best_score = 0.0
+        if outcome_tokens:
+            for m, _label, _ticker, m_tokens in market_meta:
+                if not m_tokens:
+                    continue
+                if len(outcome_tokens & m_tokens) < 1:
+                    continue
+                score = _jaccard(outcome_tokens, m_tokens)
+                if score > best_score:
+                    best_score = score
+                    best = m
+        if best is not None and best_score >= 0.25:
+            return best
+
+        # Strategy 2: substring (case-insensitive, either direction)
+        if outcome_lower:
+            for m, label, _ticker, _tokens in market_meta:
+                if not label:
+                    continue
+                if outcome_lower in label or label in outcome_lower:
+                    return m
+
+        # Strategy 3: ticker-suffix match (loose)
+        # E.g. outcome "0.10" matches ticker "EVT-T0.10"; outcome "Yes"
+        # matches ticker "EVT-YES".
+        normalized_outcome = re.sub(r"[^a-z0-9]", "", outcome_lower)
+        if normalized_outcome:
+            for m, _label, ticker, _tokens in market_meta:
+                normalized_ticker = re.sub(r"[^a-z0-9]", "", ticker)
+                if normalized_outcome and normalized_outcome in normalized_ticker:
+                    return m
+
+        # Strategy 1 backup: even a weak Jaccard match is better than nothing.
+        return best
 
     matched_count = 0
     out: list[dict[str, Any]] = []
     for outcome in outcomes:
         outcome_str = str(outcome)
-        outcome_tokens = _normalize(outcome_str)
-
-        best_market: dict[str, Any] | None = None
-        best_score = 0.0
-        if outcome_tokens:
-            for m, m_tokens in market_tokens:
-                overlap = len(outcome_tokens & m_tokens)
-                if overlap < 1:
-                    continue
-                score = _jaccard(outcome_tokens, m_tokens)
-                if score > best_score:
-                    best_score = score
-                    best_market = m
+        best_market = _match_outcome(outcome_str)
 
         prob = 0.5
         if best_market is not None:
@@ -636,7 +686,7 @@ def kalshi_multi_outcome_probabilities(
         event_ticker,
         matched_count,
         len(outcomes),
-        len(market_tokens),
+        len(market_meta),
     )
     return out
 
