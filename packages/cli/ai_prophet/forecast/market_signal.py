@@ -257,11 +257,27 @@ def _kalshi_get(url: str, params: dict[str, Any] | None = None) -> dict | list |
     """GET a Kalshi URL with auth if configured, fall back to elections on 401/403/5xx.
 
     Returns the parsed JSON body on success, ``None`` on any failure.
+    Logs the response body on 401/403 so we can diagnose auth issues.
     """
     try:
         headers = _kalshi_auth_headers("GET", url)
+        # When we have auth headers, send Content-Type too — some
+        # Kalshi gateways are strict about it even on GET.
+        if headers:
+            headers = {**headers, "Content-Type": "application/json"}
         with httpx.Client(timeout=REQUEST_TIMEOUT, headers=headers) as client:
             resp = client.get(url, params=params)
+        if resp.status_code in (401, 403):
+            # Surface the actual rejection reason — critical for diagnosing
+            # signature/key-permission failures.
+            body_snippet = (resp.text or "")[:300].replace("\n", " ")
+            logger.info(
+                "kalshi %s on %s — body=%r (auth_attempted=%s)",
+                resp.status_code,
+                url,
+                body_snippet,
+                headers is not None and "KALSHI-ACCESS-KEY" in (headers or {}),
+            )
         if resp.status_code in (401, 403) or resp.status_code >= 500:
             # Auth or server failure on trading-api → try elections.
             if KALSHI_TRADING_URL in url:
@@ -674,10 +690,19 @@ def kalshi_multi_outcome_probabilities(
         out.append({"market": outcome_str, "probability": round(prob, 4)})
 
     if matched_count == 0:
+        # Diagnostic: show what we were trying to match against, so the
+        # next iteration can tune the matcher properly.
+        sample_meta = [
+            f"ticker={t!r} label={lab!r}"
+            for _m, lab, t, _tok in market_meta[:5]
+        ]
         logger.info(
-            "kalshi event=%s matched 0/%d outcomes to child markets",
+            "kalshi event=%s matched 0/%d outcomes to child markets "
+            "(outcomes=%r ; first_children=%s)",
             event_ticker,
             len(outcomes),
+            outcomes[:5],
+            sample_meta,
         )
         return None
 
